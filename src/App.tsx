@@ -657,7 +657,11 @@ function App() {
         return;
       }
 
-      if (!activeAsset.isImage && !activeAsset.isAudio) {
+      const isJsonAsset =
+        activeAsset.extension.toLowerCase() === "json" ||
+        activeAsset.extension.toLowerCase() === "mcmeta";
+
+      if (!activeAsset.isImage && !activeAsset.isAudio && !isJsonAsset) {
         return;
       }
 
