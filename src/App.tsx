@@ -8,6 +8,7 @@ import {
   type MouseEvent,
   type ReactElement,
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -67,11 +68,6 @@ type ScanProgressEvent = {
   currentSource?: string;
 };
 
-type ScanChunkEvent = {
-  scanId: string;
-  assets: AssetRecord[];
-};
-
 type ScanCompletedEvent = {
   scanId: string;
   lifecycle: ScanLifecycle;
@@ -102,6 +98,7 @@ const SEARCH_PAGE_SIZE = 320;
 const SEARCH_DEBOUNCE_MS = 260;
 const AUTO_SCAN_DEBOUNCE_MS = 260;
 const PROGRESS_STATUS_THROTTLE_MS = 250;
+const PREVIEW_TOP_GAP_PX = 14;
 
 function App() {
   const [prismRootInput, setPrismRootInput] = useState("");
@@ -145,6 +142,7 @@ function App() {
   const [isSaving, setIsSaving] = useState(false);
   const [isCopying, setIsCopying] = useState(false);
   const [statusLine, setStatusLine] = useState("Ready.");
+  const [topbarHeight, setTopbarHeight] = useState(0);
 
   const activeScanIdRef = useRef<string | null>(null);
   const searchRequestSeqRef = useRef(0);
@@ -158,16 +156,22 @@ function App() {
   const listParentRef = useRef<HTMLDivElement | null>(null);
   const previewContentRef = useRef<HTMLDivElement | null>(null);
   const previewPanelRef = useRef<HTMLElement | null>(null);
+  const topbarRef = useRef<HTMLElement | null>(null);
+  const deferredQuery = useDeferredValue(query);
 
   const selectedAssetIds = useMemo(() => Array.from(selectedAssets), [selectedAssets]);
+  const assetById = useMemo(
+    () => new Map(assets.map((asset) => [asset.assetId, asset])),
+    [assets],
+  );
 
   const activeAsset = useMemo(() => {
     if (!activeAssetId) {
       return null;
     }
 
-    return assets.find((asset) => asset.assetId === activeAssetId) ?? null;
-  }, [activeAssetId, assets]);
+    return assetById.get(activeAssetId) ?? null;
+  }, [activeAssetId, assetById]);
 
   const virtualizer = useVirtualizer({
     count: assets.length,
@@ -570,13 +574,34 @@ function App() {
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
-      setDebouncedQuery(query.trim());
+      setDebouncedQuery(deferredQuery.trim());
     }, SEARCH_DEBOUNCE_MS);
 
     return () => {
       window.clearTimeout(timeout);
     };
-  }, [query]);
+  }, [deferredQuery]);
+
+  useEffect(() => {
+    const element = topbarRef.current;
+    if (!element) {
+      return;
+    }
+
+    const updateHeight = () => {
+      setTopbarHeight(Math.ceil(element.getBoundingClientRect().height));
+    };
+
+    updateHeight();
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(element);
+    window.addEventListener("resize", updateHeight);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateHeight);
+    };
+  }, []);
 
   useEffect(() => {
     const boot = async () => {
@@ -693,13 +718,26 @@ function App() {
       return;
     }
 
-    previewContentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
-    previewPanelRef.current?.scrollIntoView({
-      behavior: "smooth",
-      block: "nearest",
-      inline: "nearest",
-    });
-  }, [activeAssetId]);
+    previewContentRef.current?.scrollTo({ top: 0, behavior: "auto" });
+
+    if (window.matchMedia("(max-width: 1180px)").matches) {
+      return;
+    }
+
+    const panel = previewPanelRef.current;
+    if (!panel) {
+      return;
+    }
+
+    const stickyTopOffset = topbarHeight + PREVIEW_TOP_GAP_PX;
+    const bounds = panel.getBoundingClientRect();
+    if (bounds.top >= stickyTopOffset && bounds.bottom <= window.innerHeight) {
+      return;
+    }
+
+    const targetTop = Math.max(0, window.scrollY + bounds.top - stickyTopOffset);
+    window.scrollTo({ top: targetTop, behavior: "smooth" });
+  }, [activeAssetId, topbarHeight]);
 
   useEffect(() => {
     const registerListeners = async () => {
@@ -717,8 +755,6 @@ function App() {
           );
         }
       });
-
-      const unlistenChunk = await listen<ScanChunkEvent>("scan://chunk", () => {});
 
       const unlistenComplete = await listen<ScanCompletedEvent>("scan://completed", (event) => {
         if (event.payload.scanId !== activeScanIdRef.current) {
@@ -750,7 +786,6 @@ function App() {
 
       return () => {
         unlistenProgress();
-        unlistenChunk();
         unlistenComplete();
         unlistenError();
       };
@@ -774,14 +809,34 @@ function App() {
     !!activeAsset &&
     (activeAsset.extension.toLowerCase() === "json" ||
       activeAsset.extension.toLowerCase() === "mcmeta");
-  const jsonPreviewText =
-    activeAsset && activeAssetIsJson && currentPreview
-      ? decodePreviewJson(currentPreview.base64)
-      : null;
+  const jsonPreviewText = useMemo(() => {
+    if (!activeAsset || !activeAssetIsJson || !currentPreview) {
+      return null;
+    }
+
+    return decodePreviewJson(currentPreview.base64);
+  }, [activeAsset, activeAssetIsJson, currentPreview]);
+
+  const highlightedJson = useMemo(() => {
+    if (!jsonPreviewText) {
+      return null;
+    }
+
+    return renderHighlightedJson(jsonPreviewText);
+  }, [jsonPreviewText]);
+
+  const renderedTree = useMemo(() => renderTree(ROOT_NODE_ID, 0), [renderTree]);
+  const appShellStyle = useMemo(
+    () =>
+      ({
+        "--topbar-height": `${topbarHeight}px`,
+      }) as CSSProperties,
+    [topbarHeight],
+  );
 
   return (
-    <div className="app-shell">
-      <header className="topbar">
+    <div className="app-shell" style={appShellStyle}>
+      <header className="topbar" ref={topbarRef}>
         <div className="topbar-grid">
           <div className="field-group">
             <label className="field-label" htmlFor="prism-root-input">
@@ -969,7 +1024,7 @@ function App() {
             <span className="tree-icon">▾</span>
             <span>All assets</span>
           </button>
-          <div className="tree-scroll">{renderTree(ROOT_NODE_ID, 0)}</div>
+          <div className="tree-scroll">{renderedTree}</div>
         </aside>
 
         <section className="list-panel">
@@ -1142,8 +1197,8 @@ function App() {
                 />
               ) : null}
 
-              {activeAssetIsJson && jsonPreviewText ? (
-                <pre className="json-preview">{renderHighlightedJson(jsonPreviewText)}</pre>
+              {activeAssetIsJson && highlightedJson ? (
+                <pre className="json-preview">{highlightedJson}</pre>
               ) : null}
 
               {!currentPreview ? (

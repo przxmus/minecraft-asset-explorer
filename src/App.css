@@ -308,8 +308,8 @@ body {
 .preview-panel {
   min-height: 0;
   position: sticky;
-  top: 94px;
-  max-height: calc(100dvh - 108px);
+  top: calc(var(--topbar-height, 0px) + 12px);
+  max-height: calc(100dvh - var(--topbar-height, 0px) - 26px);
   align-self: start;
 }
 
