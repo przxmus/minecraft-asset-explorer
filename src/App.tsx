@@ -121,6 +121,7 @@ function App() {
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [filterImages, setFilterImages] = useState(true);
   const [filterAudio, setFilterAudio] = useState(true);
+  const [filterOther, setFilterOther] = useState(false);
 
   const [treeByNodeId, setTreeByNodeId] = useState<Record<string, TreeNode[]>>({
     [ROOT_NODE_ID]: [],
@@ -286,7 +287,7 @@ function App() {
             limit: SEARCH_PAGE_SIZE,
             includeImages: filterImages,
             includeAudio: filterAudio,
-            includeOther: false,
+            includeOther: filterOther,
           },
         });
 
@@ -311,7 +312,14 @@ function App() {
         }
       }
     },
-    [debouncedQuery, filterAudio, filterImages, resetSearchState, selectedFolderId],
+    [
+      debouncedQuery,
+      filterAudio,
+      filterImages,
+      filterOther,
+      resetSearchState,
+      selectedFolderId,
+    ],
   );
 
   const startScan = useCallback(async () => {
@@ -900,6 +908,16 @@ function App() {
               disabled={isExplorerLocked}
             />
             Audio
+          </label>
+
+          <label className="mae-checkbox filter-pill">
+            <input
+              type="checkbox"
+              checked={filterOther}
+              onChange={(event) => setFilterOther(event.currentTarget.checked)}
+              disabled={isExplorerLocked}
+            />
+            Other
           </label>
 
           <button
