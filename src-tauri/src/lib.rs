@@ -4,8 +4,7 @@ use ffmpeg_sidecar::download::{download_ffmpeg_package, ffmpeg_download_url, unp
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    env,
-    fs,
+    env, fs,
     io::Read,
     path::{Path, PathBuf},
     process::Command,
@@ -16,6 +15,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use strsim::damerau_levenshtein;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -38,7 +38,8 @@ struct ScanState {
     cancelled: bool,
     assets: Vec<AssetRecord>,
     asset_index: HashMap<String, usize>,
-    search_index: HashMap<String, AssetSearchRecord>,
+    search_records: Vec<AssetSearchRecord>,
+    search_cache: Option<CachedSearchResults>,
     tree_children: HashMap<String, Vec<TreeNode>>,
     last_progress_emit_at: Option<Instant>,
 }
@@ -56,7 +57,8 @@ impl ScanState {
             cancelled: false,
             assets: Vec::new(),
             asset_index: HashMap::new(),
-            search_index: HashMap::new(),
+            search_records: Vec::new(),
+            search_cache: None,
             tree_children,
             last_progress_emit_at: None,
         }
@@ -86,6 +88,12 @@ struct AssetSearchRecord {
     compact_filename_stem: String,
     key: String,
     folder_node_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSearchResults {
+    signature: String,
+    ordered_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,7 +410,10 @@ fn detect_prism_roots() -> Result<Vec<PrismRootCandidate>, String> {
     }
 
     if let Ok(custom_root) = env::var("PRISM_ROOT") {
-        candidates.push(build_candidate(PathBuf::from(custom_root), "env-prism-root"));
+        candidates.push(build_candidate(
+            PathBuf::from(custom_root),
+            "env-prism-root",
+        ));
     }
 
     dedupe_candidates(candidates)
@@ -439,11 +450,14 @@ fn list_instances(prism_root: String) -> Result<Vec<InstanceInfo>, String> {
         }
 
         // Real Prism instances should contain profile metadata and minecraft folder.
-        if !instance_path.join("mmc-pack.json").is_file() || !instance_path.join("minecraft").is_dir() {
+        if !instance_path.join("mmc-pack.json").is_file()
+            || !instance_path.join("minecraft").is_dir()
+        {
             continue;
         }
 
-        let display_name = instance_display_name(&instance_path).unwrap_or_else(|| folder_name.clone());
+        let display_name =
+            instance_display_name(&instance_path).unwrap_or_else(|| folder_name.clone());
         let minecraft_version = parse_minecraft_version(&instance_path.join("mmc-pack.json"));
 
         instances.push(InstanceInfo {
@@ -564,13 +578,13 @@ fn list_tree_children(
 
 #[tauri::command]
 fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<SearchResponse, String> {
-    let scans = state
+    let mut scans = state
         .scans
         .lock()
         .map_err(|_| "Failed to lock scans state".to_string())?;
 
     let scan = scans
-        .get(&req.scan_id)
+        .get_mut(&req.scan_id)
         .ok_or_else(|| format!("Unknown scan id: {}", req.scan_id))?;
 
     let offset = req.offset.unwrap_or(0);
@@ -582,73 +596,98 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
         .folder_node_id
         .as_deref()
         .filter(|value| !value.trim().is_empty() && *value != ROOT_NODE_ID);
-
-    if req.query.trim().is_empty() {
-        let mut total = 0usize;
-        let mut assets = Vec::new();
-        let stop_at = offset.saturating_add(limit);
-
-        for asset in &scan.assets {
-            let Some(index) = scan.search_index.get(&asset.asset_id) else {
-                continue;
-            };
-
-            if !asset_matches_media(asset, include_images, include_audio, include_other) {
-                continue;
-            }
-
-            if !asset_matches_folder(index, folder_filter) {
-                continue;
-            }
-
-            if total >= offset && total < stop_at {
-                assets.push(asset.clone());
-            }
-            total += 1;
-        }
-
-        return Ok(SearchResponse { total, assets });
-    }
-
     let query_tokens = split_tokens(&req.query);
     let query_compact = compact_text(&req.query);
+    let normalized_query = query_tokens.join(" ");
+    let signature = build_search_signature(
+        &normalized_query,
+        folder_filter,
+        include_images,
+        include_audio,
+        include_other,
+    );
 
-    let mut ranked = Vec::new();
+    if !(include_images || include_audio || include_other) {
+        return Ok(SearchResponse {
+            total: 0,
+            assets: Vec::new(),
+        });
+    }
 
-    for asset in &scan.assets {
-        let Some(index) = scan.search_index.get(&asset.asset_id) else {
-            continue;
+    let needs_rebuild = scan
+        .search_cache
+        .as_ref()
+        .map(|cache| cache.signature.as_str() != signature)
+        .unwrap_or(true);
+
+    if needs_rebuild {
+        let ordered_indices = if query_tokens.is_empty() {
+            let mut results = Vec::new();
+
+            for (index, asset) in scan.assets.iter().enumerate() {
+                if !asset_matches_media(asset, include_images, include_audio, include_other) {
+                    continue;
+                }
+
+                let search_record = &scan.search_records[index];
+                if !asset_matches_folder(search_record, folder_filter) {
+                    continue;
+                }
+
+                results.push(index);
+            }
+
+            results
+        } else {
+            let mut ranked = Vec::new();
+
+            for (index, asset) in scan.assets.iter().enumerate() {
+                if !asset_matches_media(asset, include_images, include_audio, include_other) {
+                    continue;
+                }
+
+                let search_record = &scan.search_records[index];
+                if !asset_matches_folder(search_record, folder_filter) {
+                    continue;
+                }
+
+                if let Some(score) = score_query(
+                    search_record,
+                    &query_tokens,
+                    &query_compact,
+                    &normalized_query,
+                ) {
+                    ranked.push((score, index));
+                }
+            }
+
+            ranked.sort_unstable_by(|left, right| {
+                right
+                    .0
+                    .cmp(&left.0)
+                    .then_with(|| scan.assets[left.1].key.cmp(&scan.assets[right.1].key))
+            });
+
+            ranked.into_iter().map(|(_, index)| index).collect()
         };
 
-        if !asset_matches_media(asset, include_images, include_audio, include_other) {
-            continue;
-        }
-
-        if !asset_matches_folder(index, folder_filter) {
-            continue;
-        }
-
-        if let Some(score) = score_query(index, &query_tokens, &query_compact, &req.query) {
-            ranked.push((score, asset));
-        }
-    }
-
-    let total = ranked.len();
-    let wanted = offset.saturating_add(limit).max(1);
-    if ranked.len() > wanted {
-        ranked.select_nth_unstable_by(wanted - 1, |left, right| {
-            right.0.cmp(&left.0).then(left.1.key.cmp(&right.1.key))
+        scan.search_cache = Some(CachedSearchResults {
+            signature,
+            ordered_indices,
         });
-        ranked.truncate(wanted);
     }
 
-    ranked.sort_unstable_by(|left, right| right.0.cmp(&left.0).then(left.1.key.cmp(&right.1.key)));
-
-    let assets = ranked
+    let ordered_indices = &scan
+        .search_cache
+        .as_ref()
+        .ok_or_else(|| "Search cache is missing".to_string())?
+        .ordered_indices;
+    let total = ordered_indices.len();
+    let assets = ordered_indices
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|(_, asset)| asset.clone())
+        .map(|index| scan.assets[*index].clone())
         .collect();
 
     Ok(SearchResponse { total, assets })
@@ -800,7 +839,13 @@ fn convert_audio_asset(
         .map_err(|error| format!("Failed to create temporary conversion directory: {error}"))?;
 
     let mut used_names = HashSet::new();
-    let output_path = materialize_asset(&app, &asset, &temp_root, req.format.clone(), &mut used_names)?;
+    let output_path = materialize_asset(
+        &app,
+        &asset,
+        &temp_root,
+        req.format.clone(),
+        &mut used_names,
+    )?;
 
     {
         let mut temp_paths = state
@@ -831,7 +876,11 @@ fn run_scan_worker(app: AppHandle, scan_id: String, req: StartScanRequest) {
     }
 }
 
-fn run_scan_worker_inner(app: &AppHandle, scan_id: &str, req: &StartScanRequest) -> Result<(), String> {
+fn run_scan_worker_inner(
+    app: &AppHandle,
+    scan_id: &str,
+    req: &StartScanRequest,
+) -> Result<(), String> {
     let prism_root = expand_home(&req.prism_root);
     validate_prism_root(&prism_root)?;
 
@@ -885,34 +934,32 @@ fn run_scan_worker_inner(app: &AppHandle, scan_id: &str, req: &StartScanRequest)
         let app = app.clone();
         let scan_id = scan_id_owned.clone();
 
-        thread::spawn(move || {
-            loop {
-                if is_scan_cancelled(&app, &scan_id).unwrap_or(true) {
-                    break;
-                }
+        thread::spawn(move || loop {
+            if is_scan_cancelled(&app, &scan_id).unwrap_or(true) {
+                break;
+            }
 
-                let index = next_index.fetch_add(1, Ordering::Relaxed);
-                if index >= containers.len() {
-                    break;
-                }
+            let index = next_index.fetch_add(1, Ordering::Relaxed);
+            if index >= containers.len() {
+                break;
+            }
 
-                let container = &containers[index];
-                match scan_container(container) {
-                    Ok(candidates) => {
-                        if sender
-                            .send(ScanWorkerResult::Container {
-                                source_name: container.source_name.clone(),
-                                candidates,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(ScanWorkerResult::Error(error));
+            let container = &containers[index];
+            match scan_container(container) {
+                Ok(candidates) => {
+                    if sender
+                        .send(ScanWorkerResult::Container {
+                            source_name: container.source_name.clone(),
+                            candidates,
+                        })
+                        .is_err()
+                    {
                         break;
                     }
+                }
+                Err(error) => {
+                    let _ = sender.send(ScanWorkerResult::Error(error));
+                    break;
                 }
             }
         });
@@ -996,11 +1043,14 @@ fn append_assets_chunk(
 
             let index = scan.assets.len();
             scan.asset_index.insert(asset.asset_id.clone(), index);
-            scan.search_index
-                .insert(asset.asset_id.clone(), build_search_record(asset));
+            scan.search_records.push(build_search_record(asset));
             scan.assets.push(asset.clone());
             inserted_assets.push(asset.clone());
             add_asset_to_tree(&mut scan.tree_children, asset);
+        }
+
+        if !inserted_assets.is_empty() {
+            scan.search_cache = None;
         }
 
         let now = Instant::now();
@@ -1249,7 +1299,9 @@ fn scan_container(container: &ScanContainer) -> Result<Vec<AssetCandidate>, Stri
     }
 }
 
-fn scan_vanilla_asset_index_container(container: &ScanContainer) -> Result<Vec<AssetCandidate>, String> {
+fn scan_vanilla_asset_index_container(
+    container: &ScanContainer,
+) -> Result<Vec<AssetCandidate>, String> {
     let content = fs::read_to_string(&container.container_path).map_err(|error| {
         format!(
             "Failed to read vanilla asset index {}: {error}",
@@ -1370,11 +1422,19 @@ fn scan_directory_container(container: &ScanContainer) -> Result<Vec<AssetCandid
 }
 
 fn scan_archive_container(container: &ScanContainer) -> Result<Vec<AssetCandidate>, String> {
-    let file = fs::File::open(&container.container_path)
-        .map_err(|error| format!("Failed to open archive {}: {error}", container.container_path.display()))?;
+    let file = fs::File::open(&container.container_path).map_err(|error| {
+        format!(
+            "Failed to open archive {}: {error}",
+            container.container_path.display()
+        )
+    })?;
 
-    let mut archive = ZipArchive::new(file)
-        .map_err(|error| format!("Failed to read archive {}: {error}", container.container_path.display()))?;
+    let mut archive = ZipArchive::new(file).map_err(|error| {
+        format!(
+            "Failed to read archive {}: {error}",
+            container.container_path.display()
+        )
+    })?;
 
     let mut assets = Vec::new();
 
@@ -1423,7 +1483,10 @@ struct ParsedAssetPath {
 }
 
 fn parse_asset_relative_path(path: &str) -> Option<ParsedAssetPath> {
-    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     let assets_index = segments.iter().position(|segment| *segment == "assets")?;
 
     if segments.len() <= assets_index + 2 {
@@ -1605,19 +1668,32 @@ fn score_query(
     index: &AssetSearchRecord,
     query_tokens: &[String],
     query_compact: &str,
-    raw_query: &str,
+    normalized_query: &str,
 ) -> Option<i64> {
     if query_tokens.is_empty() {
         return Some(0);
     }
 
     let mut score = 0i64;
+    let mut matched_tokens = 0usize;
 
     for query_token in query_tokens {
         let mut token_score = 0i64;
 
-        token_score = token_score.max(score_token_group(&index.filename_tokens, query_token, 260, 200, 150));
-        token_score = token_score.max(score_token_group(&index.path_tokens, query_token, 170, 130, 95));
+        token_score = token_score.max(score_token_group(
+            &index.filename_tokens,
+            query_token,
+            320,
+            250,
+            180,
+        ));
+        token_score = token_score.max(score_token_group(
+            &index.path_tokens,
+            query_token,
+            170,
+            130,
+            95,
+        ));
         token_score = token_score.max(score_token_group(
             &index.namespace_tokens,
             query_token,
@@ -1625,15 +1701,49 @@ fn score_query(
             110,
             80,
         ));
-        token_score = token_score.max(score_token_group(&index.source_tokens, query_token, 130, 100, 75));
-        token_score = token_score.max(score_token_group(&index.all_tokens, query_token, 100, 80, 60));
+        token_score = token_score.max(score_token_group(
+            &index.source_tokens,
+            query_token,
+            130,
+            100,
+            76,
+        ));
+        token_score = token_score.max(score_token_group(
+            &index.all_tokens,
+            query_token,
+            100,
+            80,
+            60,
+        ));
 
         if token_score == 0 {
-            return None;
+            score -= 100;
+            continue;
         }
 
+        matched_tokens += 1;
         score += token_score;
     }
+
+    let token_count = query_tokens.len();
+    let required_matches = if token_count <= 2 {
+        token_count
+    } else {
+        ((token_count * 3) + 4) / 5
+    };
+
+    if matched_tokens < required_matches {
+        return None;
+    }
+
+    let missing_tokens = token_count.saturating_sub(matched_tokens);
+    if missing_tokens > 0 {
+        score -= (missing_tokens as i64) * 70;
+    } else {
+        score += 90;
+    }
+
+    score += (matched_tokens as i64) * 48;
 
     if !query_compact.is_empty() {
         if index.compact_filename_stem == query_compact {
@@ -1649,17 +1759,13 @@ fn score_query(
         }
     }
 
-    let lower_query = raw_query.to_ascii_lowercase();
-    if index.key.contains(&lower_query) {
+    if !normalized_query.is_empty() && index.key.contains(normalized_query) {
         score += 80;
     }
 
-    let extra_filename_tokens = index
-        .filename_tokens
-        .len()
-        .saturating_sub(query_tokens.len());
+    let extra_filename_tokens = index.filename_tokens.len().saturating_sub(matched_tokens);
     if extra_filename_tokens > 0 {
-        score -= (extra_filename_tokens as i64) * 20;
+        score -= (extra_filename_tokens as i64) * 8;
     }
 
     Some(score)
@@ -1676,13 +1782,51 @@ fn score_token_group(
     for token in tokens {
         if token == query_token {
             best = best.max(exact_weight);
-        } else if token.starts_with(query_token) {
+        } else if token.starts_with(query_token) || query_token.starts_with(token) {
             best = best.max(prefix_weight);
-        } else if token.contains(query_token) {
+        } else if token.contains(query_token) || query_token.contains(token) {
             best = best.max(contains_weight);
+        } else {
+            best = best.max(score_fuzzy_token(token, query_token));
         }
     }
     best
+}
+
+fn score_fuzzy_token(token: &str, query_token: &str) -> i64 {
+    let token_len = token.len();
+    let query_len = query_token.len();
+    if token_len < 3 || query_len < 3 {
+        return 0;
+    }
+
+    let max_len = token_len.max(query_len);
+    let len_delta = token_len.abs_diff(query_len);
+    if len_delta > 3 {
+        return 0;
+    }
+
+    let distance = damerau_levenshtein(token, query_token);
+
+    match (distance, max_len) {
+        (1, 4..) => 72,
+        (2, 4..) => 54,
+        (3, 9..) => 40,
+        _ => 0,
+    }
+}
+
+fn build_search_signature(
+    normalized_query: &str,
+    folder_filter: Option<&str>,
+    include_images: bool,
+    include_audio: bool,
+    include_other: bool,
+) -> String {
+    format!(
+        "q={normalized_query}|f={}|i={include_images}|a={include_audio}|o={include_other}",
+        folder_filter.unwrap_or(ROOT_NODE_ID)
+    )
 }
 
 fn asset_matches_folder(index: &AssetSearchRecord, folder_filter: Option<&str>) -> bool {
@@ -1690,7 +1834,10 @@ fn asset_matches_folder(index: &AssetSearchRecord, folder_filter: Option<&str>) 
         return true;
     };
 
-    index.folder_node_id == folder_filter || index.folder_node_id.starts_with(&format!("{folder_filter}/"))
+    index.folder_node_id == folder_filter
+        || index
+            .folder_node_id
+            .starts_with(&format!("{folder_filter}/"))
 }
 
 fn asset_matches_media(
@@ -1715,7 +1862,11 @@ fn add_asset_to_tree(tree_children: &mut HashMap<String, Vec<TreeNode>>, asset: 
     let folders = build_asset_folder_segments(asset);
 
     for segment in folders {
-        let node_name = if segment.is_empty() { "(root)" } else { &segment };
+        let node_name = if segment.is_empty() {
+            "(root)"
+        } else {
+            &segment
+        };
         let node_id = build_folder_node_id(&parent_id, node_name);
 
         upsert_tree_node(
@@ -1756,7 +1907,11 @@ fn add_asset_to_tree(tree_children: &mut HashMap<String, Vec<TreeNode>>, asset: 
 fn asset_folder_node_id(asset: &AssetRecord) -> String {
     let mut node_id = ROOT_NODE_ID.to_string();
     for segment in build_asset_folder_segments(asset) {
-        let node_name = if segment.is_empty() { "(root)" } else { &segment };
+        let node_name = if segment.is_empty() {
+            "(root)"
+        } else {
+            &segment
+        };
         node_id = build_folder_node_id(&node_id, node_name);
     }
     node_id
@@ -1788,7 +1943,11 @@ fn build_folder_node_id(parent: &str, segment: &str) -> String {
     }
 }
 
-fn upsert_tree_node(tree_children: &mut HashMap<String, Vec<TreeNode>>, parent_id: &str, node: TreeNode) {
+fn upsert_tree_node(
+    tree_children: &mut HashMap<String, Vec<TreeNode>>,
+    parent_id: &str,
+    node: TreeNode,
+) {
     let children = tree_children.entry(parent_id.to_string()).or_default();
     if children.iter().any(|child| child.id == node.id) {
         return;
@@ -1868,8 +2027,12 @@ fn materialize_asset(
     }
 
     let bytes = extract_asset_bytes(asset)?;
-    fs::write(&output_path, bytes)
-        .map_err(|error| format!("Failed to write output file {}: {error}", output_path.display()))?;
+    fs::write(&output_path, bytes).map_err(|error| {
+        format!(
+            "Failed to write output file {}: {error}",
+            output_path.display()
+        )
+    })?;
 
     Ok(output_path)
 }
@@ -1965,7 +2128,8 @@ fn convert_asset_audio_to_file(
 
     if !status.success() {
         return Err(
-            "FFmpeg conversion failed. Install FFmpeg or retry download in app settings.".to_string(),
+            "FFmpeg conversion failed. Install FFmpeg or retry download in app settings."
+                .to_string(),
         );
     }
 
@@ -1996,7 +2160,8 @@ fn resolve_ffmpeg_path(app: &AppHandle) -> Result<PathBuf, String> {
         return Ok(ffmpeg_binary);
     }
 
-    let url = ffmpeg_download_url().map_err(|error| format!("Failed to resolve FFmpeg URL: {error}"))?;
+    let url =
+        ffmpeg_download_url().map_err(|error| format!("Failed to resolve FFmpeg URL: {error}"))?;
     let archive_path = download_ffmpeg_package(url, &base_dir)
         .map_err(|error| format!("Failed to download FFmpeg runtime: {error}"))?;
     unpack_ffmpeg(&archive_path, &base_dir)
@@ -2032,7 +2197,8 @@ fn extract_asset_bytes(asset: &AssetRecord) -> Result<Vec<u8>, String> {
                 .map_err(|error| format!("Failed to read file {}: {error}", file_path.display()))
         }
         AssetContainerType::AssetIndex => Err(
-            "AssetIndex container type is metadata-only and cannot be extracted directly".to_string(),
+            "AssetIndex container type is metadata-only and cannot be extracted directly"
+                .to_string(),
         ),
         AssetContainerType::Zip | AssetContainerType::Jar => {
             let file = fs::File::open(&container_path).map_err(|error| {
@@ -2049,14 +2215,14 @@ fn extract_asset_bytes(asset: &AssetRecord) -> Result<Vec<u8>, String> {
                 )
             })?;
 
-            let mut entry = archive
-                .by_name(&asset.entry_path)
-                .map_err(|error| format!("Failed to open archive entry {}: {error}", asset.entry_path))?;
+            let mut entry = archive.by_name(&asset.entry_path).map_err(|error| {
+                format!("Failed to open archive entry {}: {error}", asset.entry_path)
+            })?;
 
             let mut buffer = Vec::new();
-            entry
-                .read_to_end(&mut buffer)
-                .map_err(|error| format!("Failed to read archive entry {}: {error}", asset.entry_path))?;
+            entry.read_to_end(&mut buffer).map_err(|error| {
+                format!("Failed to read archive entry {}: {error}", asset.entry_path)
+            })?;
 
             Ok(buffer)
         }
@@ -2103,7 +2269,9 @@ fn is_json_extension(extension: &str) -> bool {
     matches!(extension, "json" | "mcmeta")
 }
 
-fn dedupe_candidates(candidates: Vec<PrismRootCandidate>) -> Result<Vec<PrismRootCandidate>, String> {
+fn dedupe_candidates(
+    candidates: Vec<PrismRootCandidate>,
+) -> Result<Vec<PrismRootCandidate>, String> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
 
@@ -2333,15 +2501,21 @@ mod tests {
         let record = build_search_record(&asset);
 
         let tokens = split_tokens("atm star");
-        let score = score_query(&record, &tokens, &compact_text("atm star"), "atm star");
+        let score = score_query(
+            &record,
+            &tokens,
+            &compact_text("atm star"),
+            &tokens.join(" "),
+        );
 
         assert!(score.is_some());
     }
 
     #[test]
     fn parse_assets_path_from_nested_prefix() {
-        let parsed = parse_asset_relative_path("nested/content/assets/example/textures/item/star.png")
-            .expect("must parse");
+        let parsed =
+            parse_asset_relative_path("nested/content/assets/example/textures/item/star.png")
+                .expect("must parse");
 
         assert_eq!(parsed.namespace, "example");
         assert_eq!(parsed.relative_asset_path, "textures/item/star.png");
@@ -2367,13 +2541,82 @@ mod tests {
         let query = "nether star";
         let tokens = split_tokens(query);
         let compact = compact_text(query);
+        let normalized = tokens.join(" ");
 
-        let vanilla_score = score_query(&build_search_record(&vanilla), &tokens, &compact, query)
-            .expect("vanilla must match");
-        let modded_score = score_query(&build_search_record(&modded), &tokens, &compact, query)
-            .expect("modded must match");
+        let vanilla_score = score_query(
+            &build_search_record(&vanilla),
+            &tokens,
+            &compact,
+            &normalized,
+        )
+        .expect("vanilla must match");
+        let modded_score = score_query(
+            &build_search_record(&modded),
+            &tokens,
+            &compact,
+            &normalized,
+        )
+        .expect("modded must match");
 
         assert!(vanilla_score > modded_score);
+    }
+
+    #[test]
+    fn query_with_extra_token_still_matches_best_pair() {
+        let expected = sample_asset(
+            "vanilla.minecraft.minecraft.sounds.block.grass.step1.ogg",
+            AssetSourceType::Vanilla,
+            "minecraft-1.21.1",
+            "minecraft",
+            "sounds/block/grass/step1.ogg",
+        );
+
+        let unrelated = sample_asset(
+            "mod.example.example.sounds.block.stone.step1.ogg",
+            AssetSourceType::Mod,
+            "example-mod",
+            "example",
+            "sounds/block/stone/step1.ogg",
+        );
+
+        let query = "grass block step";
+        let tokens = split_tokens(query);
+        let compact = compact_text(query);
+        let normalized = tokens.join(" ");
+
+        let expected_score = score_query(
+            &build_search_record(&expected),
+            &tokens,
+            &compact,
+            &normalized,
+        )
+        .expect("expected must match");
+        let unrelated_score = score_query(
+            &build_search_record(&unrelated),
+            &tokens,
+            &compact,
+            &normalized,
+        )
+        .expect("unrelated should still match with weaker score");
+
+        assert!(expected_score > unrelated_score);
+    }
+
+    #[test]
+    fn damerau_fuzzy_match_accepts_transposed_token() {
+        let asset = sample_asset(
+            "vanilla.minecraft.minecraft.sounds.block.grass.step1.ogg",
+            AssetSourceType::Vanilla,
+            "minecraft-1.21.1",
+            "minecraft",
+            "sounds/block/grass/step1.ogg",
+        );
+        let record = build_search_record(&asset);
+        let query = "stpe";
+        let tokens = split_tokens(query);
+
+        let score = score_query(&record, &tokens, &compact_text(query), &tokens.join(" "));
+        assert!(score.is_some());
     }
 
     #[test]
@@ -2388,11 +2631,7 @@ mod tests {
 
         let index = build_search_record(&asset);
         let folder = asset_folder_node_id(&asset);
-        let parent = folder
-            .split('/')
-            .take(4)
-            .collect::<Vec<_>>()
-            .join("/");
+        let parent = folder.split('/').take(4).collect::<Vec<_>>().join("/");
 
         assert!(asset_matches_folder(&index, Some(&folder)));
         assert!(asset_matches_folder(&index, Some(&parent)));

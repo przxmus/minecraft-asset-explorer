@@ -2139,6 +2139,7 @@ dependencies = [
  "ffmpeg-sidecar",
  "serde",
  "serde_json",
+ "strsim",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

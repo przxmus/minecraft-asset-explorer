@@ -30,3 +30,4 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 base64 = "0.22"
 clipboard-rs = "0.3"
 ffmpeg-sidecar = "2.4"
+strsim = "0.11"
