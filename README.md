@@ -107,4 +107,5 @@ Cross-target notes:
   (comma-separated for multiple triples)
 - On macOS/Linux hosts, Windows builds prefer `x86_64-pc-windows-gnu` by default to avoid MSVC SDK requirements.
 - Windows GNU cross-builds on macOS/Linux also require MinGW tools (`dlltool`, `windres`), typically via `brew install mingw-w64`.
-- Set `BUILD_AUTO_INSTALL_TOOLCHAINS=1` to let the build script auto-install missing MinGW tools with Homebrew.
+- Windows installer bundling also requires NSIS (`makensis`), typically via `brew install nsis`.
+- Set `BUILD_AUTO_INSTALL_TOOLCHAINS=1` to let the build script auto-install missing MinGW/NSIS tools with Homebrew.

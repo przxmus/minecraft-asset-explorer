@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -22,6 +23,7 @@ const hostTarget = hostToTarget[host];
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, '..');
 const zigRunnerPath = resolve(repoRoot, 'scripts', 'tauri-zigbuild-runner.sh');
+const toolShimDir = resolve(repoRoot, '.codex-tool-shims');
 
 if (!hostTarget) {
   console.error(`[build] Unsupported host platform: ${host}`);
@@ -42,8 +44,11 @@ const preferredTargetTriples = {
       : ['x86_64-pc-windows-gnu', 'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc']
 };
 
-function run(cmd, args) {
-  const result = spawnSync(cmd, args, { stdio: 'inherit' });
+function run(cmd, args, { env } = {}) {
+  const result = spawnSync(cmd, args, {
+    stdio: 'inherit',
+    env: env ? { ...process.env, ...env } : process.env
+  });
   return result.status === 0;
 }
 
@@ -119,6 +124,38 @@ function ensureWindowsGnuTools() {
   return false;
 }
 
+function ensureWindowsNsisEnv() {
+  if (commandExists('makensis.exe')) {
+    return {};
+  }
+
+  const autoInstall = process.env.BUILD_AUTO_INSTALL_TOOLCHAINS === '1';
+  if (!commandExists('makensis') && autoInstall && commandExists('brew')) {
+    console.log('[build] Installing nsis via Homebrew for Windows installer bundling...');
+    const installed = run('brew', ['install', 'nsis']);
+    if (!installed) {
+      console.error('[build] Failed to install nsis.');
+      return null;
+    }
+  }
+
+  if (!commandExists('makensis') && !commandExists('makensis.exe')) {
+    console.error('[build] NSIS is required to bundle Windows installers.');
+    console.error('[build] Install with: brew install nsis');
+    return null;
+  }
+
+  if (commandExists('makensis.exe')) {
+    return {};
+  }
+
+  mkdirSync(toolShimDir, { recursive: true });
+  const shimPath = resolve(toolShimDir, 'makensis.exe');
+  writeFileSync(shimPath, '#!/usr/bin/env bash\nexec makensis "$@"\n');
+  chmodSync(shimPath, 0o755);
+  return { PATH: `${toolShimDir}:${process.env.PATH}` };
+}
+
 function resolveDefaultTargetTriple(target) {
   const preferred = preferredTargetTriples[target];
   const installed = preferred.find((triple) => installedRustTargets.has(triple));
@@ -162,6 +199,7 @@ function buildTarget(target, { continueOnFailure = false } = {}) {
     const triplePlatform = platformForTriple(triple);
     const useZigRunner = triplePlatform !== 'unknown' && triplePlatform !== hostTarget;
     const buildArgs = ['tauri', 'build', '--target', triple];
+    let envOverrides = {};
     if (useZigRunner) {
       ensureZigRunnerDeps();
       buildArgs.push('--runner', zigRunnerPath);
@@ -175,9 +213,19 @@ function buildTarget(target, { continueOnFailure = false } = {}) {
         }
         process.exit(1);
       }
+
+      const nsisEnv = ensureWindowsNsisEnv();
+      if (!nsisEnv) {
+        if (continueOnFailure) {
+          console.error(`[build] ${target} build failed for ${triple}.`);
+          return false;
+        }
+        process.exit(1);
+      }
+      envOverrides = { ...envOverrides, ...nsisEnv };
     }
 
-    const ok = run('bunx', buildArgs);
+    const ok = run('bunx', buildArgs, { env: envOverrides });
     if (!ok) {
       if (target === 'windows' && host !== 'win32') {
         console.error('[build] Hint: set TAURI_TARGET_WINDOWS=x86_64-pc-windows-gnu if MSVC toolchain is missing.');
