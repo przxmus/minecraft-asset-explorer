@@ -834,18 +834,34 @@ function App() {
     [topbarHeight],
   );
 
+  const progressPercent =
+    progress && progress.totalContainers > 0
+      ? Math.round((progress.scannedContainers / progress.totalContainers) * 100)
+      : 0;
+
+  const lifecycleDotClass =
+    lifecycle === "scanning"
+      ? "status-dot--scanning"
+      : lifecycle === "completed"
+        ? "status-dot--completed"
+        : lifecycle === "error"
+          ? "status-dot--error"
+          : "";
+
   return (
     <div className="app-shell" style={appShellStyle}>
+      {/* ── header ────────────────────────────────────────── */}
       <header className="topbar" ref={topbarRef}>
-        <div className="topbar-grid">
-          <div className="field-group">
+        {/* row 1: config */}
+        <div className="topbar-config">
+          <div className="field-group field-group--root">
             <label className="field-label" htmlFor="prism-root-input">
               Prism Root
             </label>
             <input
               id="prism-root-input"
               className="mae-input"
-              placeholder="PrismLauncher path"
+              placeholder="/path/to/PrismLauncher"
               value={prismRootInput}
               onChange={(event) => setPrismRootInput(event.currentTarget.value)}
               onBlur={() => commitPrismRoot(prismRootInput)}
@@ -857,32 +873,30 @@ function App() {
             />
           </div>
 
-          <div className="field-group">
+          <div className="field-group field-group--instance">
             <label className="field-label" htmlFor="instance-select">
               Instance
             </label>
-            <div className="field-row">
-              <select
-                id="instance-select"
-                className="mae-select"
-                value={selectedInstance}
-                onChange={(event) => setSelectedInstance(event.currentTarget.value)}
-              >
-                <option value="">Select instance...</option>
-                {instances.map((instance) => (
-                  <option key={instance.folderName} value={instance.folderName}>
-                    {instance.displayName}
-                    {instance.minecraftVersion ? ` (MC ${instance.minecraftVersion})` : ""}
-                  </option>
-                ))}
-              </select>
-            </div>
+            <select
+              id="instance-select"
+              className="mae-select"
+              value={selectedInstance}
+              onChange={(event) => setSelectedInstance(event.currentTarget.value)}
+            >
+              <option value="">Select instance...</option>
+              {instances.map((instance) => (
+                <option key={instance.folderName} value={instance.folderName}>
+                  {instance.displayName}
+                  {instance.minecraftVersion ? ` (MC ${instance.minecraftVersion})` : ""}
+                </option>
+              ))}
+            </select>
           </div>
 
-          <div className="field-group">
+          <div className="field-group field-group--sources">
             <div className="field-label">Sources</div>
-            <div className="field-row checkbox-row">
-              <label className="mae-checkbox">
+            <div className="source-checks">
+              <label className="source-check">
                 <input
                   type="checkbox"
                   checked={includeVanilla}
@@ -890,7 +904,7 @@ function App() {
                 />
                 Vanilla
               </label>
-              <label className="mae-checkbox">
+              <label className="source-check">
                 <input
                   type="checkbox"
                   checked={includeMods}
@@ -898,139 +912,169 @@ function App() {
                 />
                 Mods
               </label>
-              <label className="mae-checkbox">
+              <label className="source-check">
                 <input
                   type="checkbox"
                   checked={includeResourcepacks}
                   onChange={(event) => setIncludeResourcepacks(event.currentTarget.checked)}
                 />
-                Resourcepacks
+                Packs
               </label>
             </div>
           </div>
         </div>
 
-        <div className="status-row">
-          <div>
-            <strong>Status:</strong> {lifecycle}
-            {progress ? (
-              <span>
-                {" "}
-                | {progress.scannedContainers}/{progress.totalContainers} containers |{" "}
-                {progress.assetCount} assets
-              </span>
-            ) : null}
-          </div>
-          <div className="truncate">{statusLine}</div>
-        </div>
-
-        <div className="search-row">
+        {/* row 2: toolbar (search + filters + actions) */}
+        <div className="toolbar">
           <input
-            className="mae-search"
+            className="mae-search toolbar-search"
             value={query}
             onChange={(event) => setQuery(event.currentTarget.value)}
-            placeholder="Search: star, atm star, all the star, item star"
+            placeholder="Search assets..."
             disabled={isExplorerLocked}
           />
 
-          <select
-            className="mae-select audio-select"
-            value={audioFormat}
-            onChange={(event) => setAudioFormat(event.currentTarget.value as AudioFormat)}
-            disabled={isExplorerLocked}
-          >
-            <option value="original">Audio: original</option>
-            <option value="mp3">Audio: mp3</option>
-            <option value="wav">Audio: wav</option>
-          </select>
+          <div className="toolbar-divider" />
 
-          <label className="mae-checkbox filter-pill">
-            <input
-              type="checkbox"
-              checked={filterImages}
-              onChange={(event) => setFilterImages(event.currentTarget.checked)}
+          <div className="toolbar-filters">
+            <label className="filter-pill">
+              <input
+                type="checkbox"
+                checked={filterImages}
+                onChange={(event) => setFilterImages(event.currentTarget.checked)}
+                disabled={isExplorerLocked}
+              />
+              Images
+            </label>
+            <label className="filter-pill">
+              <input
+                type="checkbox"
+                checked={filterAudio}
+                onChange={(event) => setFilterAudio(event.currentTarget.checked)}
+                disabled={isExplorerLocked}
+              />
+              Audio
+            </label>
+            <label className="filter-pill">
+              <input
+                type="checkbox"
+                checked={filterOther}
+                onChange={(event) => setFilterOther(event.currentTarget.checked)}
+                disabled={isExplorerLocked}
+              />
+              Other
+            </label>
+
+            <select
+              className="mae-select audio-select"
+              value={audioFormat}
+              onChange={(event) => setAudioFormat(event.currentTarget.value as AudioFormat)}
               disabled={isExplorerLocked}
-            />
-            Images
-          </label>
+            >
+              <option value="original">Original</option>
+              <option value="mp3">MP3</option>
+              <option value="wav">WAV</option>
+            </select>
+          </div>
 
-          <label className="mae-checkbox filter-pill">
-            <input
-              type="checkbox"
-              checked={filterAudio}
-              onChange={(event) => setFilterAudio(event.currentTarget.checked)}
+          <div className="toolbar-divider" />
+
+          <div className="toolbar-actions">
+            <button
+              type="button"
+              className="mae-button mae-button-sm"
+              onClick={selectAllVisible}
               disabled={isExplorerLocked}
-            />
-            Audio
-          </label>
+            >
+              Select all
+            </button>
+            <button
+              type="button"
+              className="mae-button mae-button-sm"
+              onClick={clearSelection}
+              disabled={isExplorerLocked || selectedAssetIds.length === 0}
+            >
+              Clear
+            </button>
 
-          <label className="mae-checkbox filter-pill">
-            <input
-              type="checkbox"
-              checked={filterOther}
-              onChange={(event) => setFilterOther(event.currentTarget.checked)}
-              disabled={isExplorerLocked}
-            />
-            Other
-          </label>
+            <div className="toolbar-divider" />
 
-          <button
-            type="button"
-            className="mae-button"
-            onClick={selectAllVisible}
-            disabled={isExplorerLocked}
-          >
-            Select visible
-          </button>
-          <button
-            type="button"
-            className="mae-button"
-            onClick={clearSelection}
-            disabled={isExplorerLocked}
-          >
-            Clear
-          </button>
-          <button
-            type="button"
-            className="mae-button"
-            disabled={isExplorerLocked || isCopying || selectedAssetIds.length === 0}
-            onClick={() => {
-              void copyAssets(selectedAssetIds);
-            }}
-          >
-            {isCopying ? "Copying..." : `Copy selected (${selectedAssetIds.length})`}
-          </button>
-          <button
-            type="button"
-            className="mae-button mae-button-accent"
-            disabled={isExplorerLocked || isSaving || selectedAssetIds.length === 0}
-            onClick={() => {
-              void saveAssets(selectedAssetIds);
-            }}
-          >
-            {isSaving ? "Saving..." : `Save selected (${selectedAssetIds.length})`}
-          </button>
+            <button
+              type="button"
+              className="mae-button"
+              disabled={isExplorerLocked || isCopying || selectedAssetIds.length === 0}
+              onClick={() => {
+                void copyAssets(selectedAssetIds);
+              }}
+            >
+              {isCopying ? "Copying..." : `Copy (${selectedAssetIds.length})`}
+            </button>
+            <button
+              type="button"
+              className="mae-button mae-button-accent"
+              disabled={isExplorerLocked || isSaving || selectedAssetIds.length === 0}
+              onClick={() => {
+                void saveAssets(selectedAssetIds);
+              }}
+            >
+              {isSaving ? "Saving..." : `Save (${selectedAssetIds.length})`}
+            </button>
+          </div>
+        </div>
+
+        {/* row 3: status strip */}
+        <div className="status-strip">
+          <span className="status-strip__lifecycle">
+            <span className={`status-dot ${lifecycleDotClass}`} />
+            {lifecycle}
+          </span>
+
+          {progress ? (
+            <>
+              <div className="progress-bar">
+                <div
+                  className="progress-bar__fill"
+                  style={{ width: `${progressPercent}%` }}
+                />
+              </div>
+              <span className="status-strip__progress">
+                {progress.scannedContainers}/{progress.totalContainers} containers
+                &middot; {progress.assetCount} assets
+              </span>
+            </>
+          ) : null}
+
+          <span className="status-strip__message">{statusLine}</span>
         </div>
       </header>
 
+      {/* ── main content ──────────────────────────────────── */}
       <main className={`content-grid ${isExplorerLocked ? "content-grid-locked" : ""}`}>
+        {/* tree sidebar */}
         <aside className="tree-panel">
-          <div className="panel-title">Explorer</div>
+          <div className="panel-header">
+            <span className="panel-title">Explorer</span>
+          </div>
           <button
             type="button"
             className={`tree-row ${selectedFolderId === ROOT_NODE_ID ? "tree-row-active" : ""}`}
+            style={{ paddingInlineStart: "14px" }}
             onClick={() => setSelectedFolderId(ROOT_NODE_ID)}
           >
-            <span className="tree-icon">▾</span>
+            <span className="tree-icon">&#x25BE;</span>
             <span>All assets</span>
           </button>
           <div className="tree-scroll">{renderedTree}</div>
         </aside>
 
+        {/* asset list */}
         <section className="list-panel">
-          <div className="panel-title">
-            Assets ({assets.length}/{searchTotal})
-            {isSearchLoading ? " · loading..." : ""}
+          <div className="panel-header">
+            <span className="panel-title">Assets</span>
+            <span className="panel-subtitle">
+              {assets.length}/{searchTotal}
+              {isSearchLoading ? " loading..." : ""}
+            </span>
           </div>
 
           <div
@@ -1126,27 +1170,28 @@ function App() {
                       </span>
                     </button>
 
-                    <button
-                      type="button"
-                      className="mae-button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void copyAssets([asset.assetId]);
-                      }}
-                    >
-                      Copy
-                    </button>
-
-                    <button
-                      type="button"
-                      className="mae-button"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void saveAssets([asset.assetId]);
-                      }}
-                    >
-                      Save
-                    </button>
+                    <div className="asset-row-actions">
+                      <button
+                        type="button"
+                        className="mae-button mae-button-sm"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void copyAssets([asset.assetId]);
+                        }}
+                      >
+                        Copy
+                      </button>
+                      <button
+                        type="button"
+                        className="mae-button mae-button-sm"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void saveAssets([asset.assetId]);
+                        }}
+                      >
+                        Save
+                      </button>
+                    </div>
                   </div>
                 );
               })}
@@ -1169,15 +1214,23 @@ function App() {
           </div>
         </section>
 
+        {/* preview panel */}
         <aside className="preview-panel" ref={previewPanelRef}>
-          <div className="panel-title">Preview</div>
+          <div className="panel-header">
+            <span className="panel-title">Preview</span>
+          </div>
+
           {!activeAsset ? (
-            <p className="muted">Select an asset to see preview.</p>
+            <div className="preview-empty">
+              Select an asset to preview
+            </div>
           ) : (
             <div className="preview-content" ref={previewContentRef}>
               <div className="preview-key">{activeAsset.key}</div>
               <div className="preview-meta">
-                {activeAsset.containerType} · {activeAsset.extension || "no-ext"}
+                <span className="preview-tag">{activeAsset.sourceType}</span>
+                <span className="preview-tag">{activeAsset.containerType}</span>
+                <span className="preview-tag">.{activeAsset.extension || "?"}</span>
               </div>
 
               {activeAsset.isImage && currentPreview ? (
@@ -1201,13 +1254,14 @@ function App() {
                 <pre className="json-preview">{highlightedJson}</pre>
               ) : null}
 
-              {!currentPreview ? (
+              {!currentPreview &&
+                (activeAsset.isImage || activeAsset.isAudio || activeAssetIsJson) ? (
                 <div className="preview-fallback">Loading preview...</div>
               ) : null}
 
               {!activeAsset.isImage && !activeAsset.isAudio && !activeAssetIsJson ? (
                 <div className="preview-fallback">
-                  Preview is available for image, audio and JSON assets.
+                  Preview available for images, audio, and JSON.
                 </div>
               ) : null}
 
@@ -1235,18 +1289,19 @@ function App() {
           )}
         </aside>
 
+        {/* locked overlay */}
         {isExplorerLocked ? (
           <div className="content-overlay">
             <div className="overlay-card">
               <div className="overlay-title">
-                {needsInstanceSelection ? "Choose an instance" : "Loading assets..."}
+                {needsInstanceSelection ? "Choose an instance" : "Scanning assets..."}
               </div>
               <div className="overlay-subtitle">
                 {needsInstanceSelection
                   ? instances.length === 0
-                    ? "No valid instances found in this Prism root."
-                    : "Select an instance to start scanning assets."
-                  : "Explorer will unlock automatically after scan completes."}
+                    ? "No instances found. Check your Prism root path."
+                    : "Select an instance above to start exploring."
+                  : "The explorer will unlock when the scan completes."}
               </div>
             </div>
           </div>
