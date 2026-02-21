@@ -9,8 +9,12 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -36,6 +40,7 @@ struct ScanState {
     asset_index: HashMap<String, usize>,
     search_index: HashMap<String, AssetSearchRecord>,
     tree_children: HashMap<String, Vec<TreeNode>>,
+    last_progress_emit_at: Option<Instant>,
 }
 
 impl ScanState {
@@ -53,6 +58,7 @@ impl ScanState {
             asset_index: HashMap::new(),
             search_index: HashMap::new(),
             tree_children,
+            last_progress_emit_at: None,
         }
     }
 
@@ -70,9 +76,16 @@ impl ScanState {
 
 #[derive(Debug, Clone)]
 struct AssetSearchRecord {
-    tokens: Vec<String>,
-    compact: String,
+    all_tokens: Vec<String>,
+    filename_tokens: Vec<String>,
+    path_tokens: Vec<String>,
+    namespace_tokens: Vec<String>,
+    source_tokens: Vec<String>,
+    compact_all: String,
+    compact_filename: String,
+    compact_filename_stem: String,
     key: String,
+    folder_node_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +243,7 @@ struct SearchRequest {
     query: String,
     offset: Option<usize>,
     limit: Option<usize>,
+    folder_node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -525,18 +539,26 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
         .ok_or_else(|| format!("Unknown scan id: {}", req.scan_id))?;
 
     let offset = req.offset.unwrap_or(0);
-    let limit = req.limit.unwrap_or(200).min(1000);
+    let limit = req.limit.unwrap_or(200).clamp(1, 1000);
+    let folder_filter = req
+        .folder_node_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty() && *value != ROOT_NODE_ID);
 
     if req.query.trim().is_empty() {
-        let total = scan.assets.len();
-        let assets = scan
-            .assets
-            .iter()
-            .skip(offset)
-            .take(limit)
-            .cloned()
-            .collect();
+        let mut filtered = Vec::new();
+        for asset in &scan.assets {
+            let Some(index) = scan.search_index.get(&asset.asset_id) else {
+                continue;
+            };
 
+            if asset_matches_folder(index, folder_filter) {
+                filtered.push(asset.clone());
+            }
+        }
+
+        let total = filtered.len();
+        let assets = filtered.into_iter().skip(offset).take(limit).collect();
         return Ok(SearchResponse { total, assets });
     }
 
@@ -549,6 +571,10 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
         let Some(index) = scan.search_index.get(&asset.asset_id) else {
             continue;
         };
+
+        if !asset_matches_folder(index, folder_filter) {
+            continue;
+        }
 
         if let Some(score) = score_query(index, &query_tokens, &query_compact, &req.query) {
             ranked.push((score, asset));
@@ -576,8 +602,8 @@ fn get_asset_preview(
 ) -> Result<AssetPreviewResponse, String> {
     let asset = get_asset_from_state(&state, &scan_id, &asset_id)?;
 
-    if !asset.is_image {
-        return Err("Preview is only available for image assets".to_string());
+    if !asset.is_image && !asset.is_audio {
+        return Err("Preview is only available for image or audio assets".to_string());
     }
 
     let bytes = extract_asset_bytes(&asset)?;
@@ -767,18 +793,107 @@ fn run_scan_worker_inner(app: &AppHandle, scan_id: &str, req: &StartScanRequest)
         }
     }
 
-    let mut key_counts = HashMap::<String, usize>::new();
+    if containers.is_empty() {
+        complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
+        return Ok(());
+    }
 
-    for (index, container) in containers.iter().enumerate() {
+    enum ScanWorkerResult {
+        Container {
+            source_name: String,
+            candidates: Vec<AssetCandidate>,
+        },
+        Error(String),
+    }
+
+    let total_containers = containers.len();
+    let workers = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .max(1)
+        .min(total_containers);
+
+    let (sender, receiver) = mpsc::channel::<ScanWorkerResult>();
+    let next_index = Arc::new(AtomicUsize::new(0));
+    let containers = Arc::new(containers);
+    let scan_id_owned = scan_id.to_string();
+
+    for _ in 0..workers {
+        let sender = sender.clone();
+        let next_index = Arc::clone(&next_index);
+        let containers = Arc::clone(&containers);
+        let app = app.clone();
+        let scan_id = scan_id_owned.clone();
+
+        thread::spawn(move || {
+            loop {
+                if is_scan_cancelled(&app, &scan_id).unwrap_or(true) {
+                    break;
+                }
+
+                let index = next_index.fetch_add(1, Ordering::Relaxed);
+                if index >= containers.len() {
+                    break;
+                }
+
+                let container = &containers[index];
+                match scan_container(container) {
+                    Ok(candidates) => {
+                        if sender
+                            .send(ScanWorkerResult::Container {
+                                source_name: container.source_name.clone(),
+                                candidates,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(ScanWorkerResult::Error(error));
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    drop(sender);
+
+    let mut key_counts = HashMap::<String, usize>::new();
+    let mut scanned_containers = 0usize;
+
+    while scanned_containers < total_containers {
         if is_scan_cancelled(app, scan_id)? {
             complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Cancelled, None)?;
             return Ok(());
         }
 
-        let candidates = scan_container(container)?;
-        let assets = finalize_assets(candidates, &mut key_counts);
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(ScanWorkerResult::Container {
+                source_name,
+                candidates,
+            }) => {
+                scanned_containers += 1;
+                let assets = finalize_assets(candidates, &mut key_counts);
 
-        append_assets_chunk(app, scan_id, &assets, index + 1, containers.len(), Some(container.source_name.clone()))?;
+                append_assets_chunk(
+                    app,
+                    scan_id,
+                    &assets,
+                    scanned_containers,
+                    total_containers,
+                    Some(source_name),
+                )?;
+            }
+            Ok(ScanWorkerResult::Error(error)) => return Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    if scanned_containers < total_containers && !is_scan_cancelled(app, scan_id)? {
+        return Err("Scan workers disconnected before processing all containers".to_string());
     }
 
     complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
@@ -793,7 +908,12 @@ fn append_assets_chunk(
     total_containers: usize,
     current_source: Option<String>,
 ) -> Result<(), String> {
+    const CHUNK_EVENT_SIZE: usize = 200;
+    const PROGRESS_THROTTLE: Duration = Duration::from_millis(125);
+
     let asset_count;
+    let mut inserted_assets = Vec::new();
+    let mut should_emit_progress = false;
 
     {
         let state = app.state::<AppState>();
@@ -819,32 +939,49 @@ fn append_assets_chunk(
             scan.search_index
                 .insert(asset.asset_id.clone(), build_search_record(asset));
             scan.assets.push(asset.clone());
+            inserted_assets.push(asset.clone());
             add_asset_to_tree(&mut scan.tree_children, asset);
+        }
+
+        let now = Instant::now();
+        let force_emit = scanned_containers >= total_containers;
+        let elapsed = scan
+            .last_progress_emit_at
+            .map(|last| now.saturating_duration_since(last))
+            .unwrap_or(PROGRESS_THROTTLE);
+
+        if force_emit || elapsed >= PROGRESS_THROTTLE {
+            should_emit_progress = true;
+            scan.last_progress_emit_at = Some(now);
         }
 
         asset_count = scan.assets.len();
     }
 
-    if !chunk.is_empty() {
+    if !inserted_assets.is_empty() {
+        for chunk in inserted_assets.chunks(CHUNK_EVENT_SIZE) {
+            let _ = app.emit(
+                "scan://chunk",
+                ScanChunkEvent {
+                    scan_id: scan_id.to_string(),
+                    assets: chunk.to_vec(),
+                },
+            );
+        }
+    }
+
+    if should_emit_progress {
         let _ = app.emit(
-            "scan://chunk",
-            ScanChunkEvent {
+            "scan://progress",
+            ScanProgressEvent {
                 scan_id: scan_id.to_string(),
-                assets: chunk.to_vec(),
+                scanned_containers,
+                total_containers,
+                asset_count,
+                current_source,
             },
         );
     }
-
-    let _ = app.emit(
-        "scan://progress",
-        ScanProgressEvent {
-            scan_id: scan_id.to_string(),
-            scanned_containers,
-            total_containers,
-            asset_count,
-            current_source,
-        },
-    );
 
     Ok(())
 }
@@ -1242,34 +1379,52 @@ fn normalize_key_segment(value: &str) -> String {
 }
 
 fn build_search_record(asset: &AssetRecord) -> AssetSearchRecord {
-    let mut token_set = HashSet::new();
+    let filename = Path::new(&asset.relative_asset_path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| asset.relative_asset_path.clone());
 
+    let filename_stem = Path::new(&filename)
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| filename.clone());
+
+    let filename_tokens = split_tokens(&filename);
+    let path_tokens = split_tokens(&asset.relative_asset_path);
+    let namespace_tokens = split_tokens(&asset.namespace);
+    let source_tokens = split_tokens(&asset.source_name);
+
+    let mut token_set = HashSet::new();
     for token in split_tokens(&asset.key) {
         token_set.insert(token);
     }
-
-    for token in split_tokens(&asset.source_name) {
-        token_set.insert(token);
+    for token in &path_tokens {
+        token_set.insert(token.clone());
+    }
+    for token in &namespace_tokens {
+        token_set.insert(token.clone());
+    }
+    for token in &source_tokens {
+        token_set.insert(token.clone());
     }
 
-    for token in split_tokens(&asset.namespace) {
-        token_set.insert(token);
-    }
-
-    for token in split_tokens(&asset.relative_asset_path) {
-        token_set.insert(token);
-    }
-
-    let mut tokens = token_set.into_iter().collect::<Vec<_>>();
-    tokens.sort();
+    let mut all_tokens = token_set.into_iter().collect::<Vec<_>>();
+    all_tokens.sort();
 
     AssetSearchRecord {
-        compact: compact_text(&format!(
+        all_tokens,
+        filename_tokens,
+        path_tokens,
+        namespace_tokens,
+        source_tokens,
+        compact_all: compact_text(&format!(
             "{} {} {} {}",
             asset.key, asset.source_name, asset.namespace, asset.relative_asset_path
         )),
+        compact_filename: compact_text(&filename),
+        compact_filename_stem: compact_text(&filename_stem),
         key: asset.key.to_lowercase(),
-        tokens,
+        folder_node_id: asset_folder_node_id(asset),
     }
 }
 
@@ -1307,20 +1462,26 @@ fn score_query(
     query_compact: &str,
     raw_query: &str,
 ) -> Option<i64> {
+    if query_tokens.is_empty() {
+        return Some(0);
+    }
+
     let mut score = 0i64;
 
     for query_token in query_tokens {
         let mut token_score = 0i64;
 
-        for token in &index.tokens {
-            if token == query_token {
-                token_score = token_score.max(140);
-            } else if token.starts_with(query_token) {
-                token_score = token_score.max(100);
-            } else if token.contains(query_token) {
-                token_score = token_score.max(75);
-            }
-        }
+        token_score = token_score.max(score_token_group(&index.filename_tokens, query_token, 260, 200, 150));
+        token_score = token_score.max(score_token_group(&index.path_tokens, query_token, 170, 130, 95));
+        token_score = token_score.max(score_token_group(
+            &index.namespace_tokens,
+            query_token,
+            140,
+            110,
+            80,
+        ));
+        token_score = token_score.max(score_token_group(&index.source_tokens, query_token, 130, 100, 75));
+        token_score = token_score.max(score_token_group(&index.all_tokens, query_token, 100, 80, 60));
 
         if token_score == 0 {
             return None;
@@ -1329,8 +1490,18 @@ fn score_query(
         score += token_score;
     }
 
-    if !query_compact.is_empty() && index.compact.contains(query_compact) {
-        score += 120;
+    if !query_compact.is_empty() {
+        if index.compact_filename_stem == query_compact {
+            score += 450;
+        } else if index.compact_filename_stem.starts_with(query_compact) {
+            score += 240;
+        } else if index.compact_filename.contains(query_compact) {
+            score += 190;
+        }
+
+        if index.compact_all.contains(query_compact) {
+            score += 120;
+        }
     }
 
     let lower_query = raw_query.to_ascii_lowercase();
@@ -1338,23 +1509,48 @@ fn score_query(
         score += 80;
     }
 
+    let extra_filename_tokens = index
+        .filename_tokens
+        .len()
+        .saturating_sub(query_tokens.len());
+    if extra_filename_tokens > 0 {
+        score -= (extra_filename_tokens as i64) * 20;
+    }
+
     Some(score)
+}
+
+fn score_token_group(
+    tokens: &[String],
+    query_token: &str,
+    exact_weight: i64,
+    prefix_weight: i64,
+    contains_weight: i64,
+) -> i64 {
+    let mut best = 0;
+    for token in tokens {
+        if token == query_token {
+            best = best.max(exact_weight);
+        } else if token.starts_with(query_token) {
+            best = best.max(prefix_weight);
+        } else if token.contains(query_token) {
+            best = best.max(contains_weight);
+        }
+    }
+    best
+}
+
+fn asset_matches_folder(index: &AssetSearchRecord, folder_filter: Option<&str>) -> bool {
+    let Some(folder_filter) = folder_filter else {
+        return true;
+    };
+
+    index.folder_node_id == folder_filter || index.folder_node_id.starts_with(&format!("{folder_filter}/"))
 }
 
 fn add_asset_to_tree(tree_children: &mut HashMap<String, Vec<TreeNode>>, asset: &AssetRecord) {
     let mut parent_id = ROOT_NODE_ID.to_string();
-    let mut folders = Vec::new();
-
-    folders.push(asset.source_type.tree_root_name().to_string());
-    folders.push(asset.source_name.clone());
-    folders.push(asset.namespace.clone());
-
-    let path = Path::new(&asset.relative_asset_path);
-    if let Some(parent) = path.parent() {
-        for segment in parent.iter() {
-            folders.push(segment.to_string_lossy().to_string());
-        }
-    }
+    let folders = build_asset_folder_segments(asset);
 
     for segment in folders {
         let node_name = if segment.is_empty() { "(root)" } else { &segment };
@@ -1393,6 +1589,32 @@ fn add_asset_to_tree(tree_children: &mut HashMap<String, Vec<TreeNode>>, asset: 
             asset_id: Some(asset.asset_id.clone()),
         },
     );
+}
+
+fn asset_folder_node_id(asset: &AssetRecord) -> String {
+    let mut node_id = ROOT_NODE_ID.to_string();
+    for segment in build_asset_folder_segments(asset) {
+        let node_name = if segment.is_empty() { "(root)" } else { &segment };
+        node_id = build_folder_node_id(&node_id, node_name);
+    }
+    node_id
+}
+
+fn build_asset_folder_segments(asset: &AssetRecord) -> Vec<String> {
+    let mut folders = Vec::new();
+
+    folders.push(asset.source_type.tree_root_name().to_string());
+    folders.push(asset.source_name.clone());
+    folders.push(asset.namespace.clone());
+
+    let path = Path::new(&asset.relative_asset_path);
+    if let Some(parent) = path.parent() {
+        for segment in parent.iter() {
+            folders.push(segment.to_string_lossy().to_string());
+        }
+    }
+
+    folders
 }
 
 fn build_folder_node_id(parent: &str, segment: &str) -> String {
@@ -1686,6 +1908,13 @@ fn mime_for_extension(extension: &str) -> &'static str {
         "tif" | "tiff" => "image/tiff",
         "ico" => "image/x-icon",
         "tga" => "image/x-tga",
+        "ogg" | "oga" => "audio/ogg",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "flac" => "audio/flac",
+        "opus" => "audio/opus",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
         _ => "application/octet-stream",
     }
 }
@@ -1899,11 +2128,14 @@ mod tests {
 
     #[test]
     fn smart_search_scores_atm_star_query() {
-        let record = AssetSearchRecord {
-            tokens: split_tokens("allthemodium.textures.item.atm_star.png"),
-            compact: compact_text("allthemodium textures item atm_star png"),
-            key: "allthemodium.textures.item.atm_star.png".to_string(),
-        };
+        let asset = sample_asset(
+            "mod.allthemodium.allthemodium.textures.item.atm_star.png",
+            AssetSourceType::Mod,
+            "allthemodium",
+            "allthemodium",
+            "textures/item/atm_star.png",
+        );
+        let record = build_search_record(&asset);
 
         let tokens = split_tokens("atm star");
         let score = score_query(&record, &tokens, &compact_text("atm star"), "atm star");
@@ -1918,5 +2150,83 @@ mod tests {
 
         assert_eq!(parsed.namespace, "example");
         assert_eq!(parsed.relative_asset_path, "textures/item/star.png");
+    }
+
+    #[test]
+    fn exact_filename_scores_higher_than_long_variant() {
+        let vanilla = sample_asset(
+            "vanilla.minecraft.minecraft.textures.item.nether_star.png",
+            AssetSourceType::Vanilla,
+            "minecraft-1.21.1",
+            "minecraft",
+            "textures/item/nether_star.png",
+        );
+        let modded = sample_asset(
+            "mod.atc.atc.blockstates.nether_star_block_2x.json",
+            AssetSourceType::Mod,
+            "allthecompressed",
+            "allthecompressed",
+            "blockstates/nether_star_block_2x.json",
+        );
+
+        let query = "nether star";
+        let tokens = split_tokens(query);
+        let compact = compact_text(query);
+
+        let vanilla_score = score_query(&build_search_record(&vanilla), &tokens, &compact, query)
+            .expect("vanilla must match");
+        let modded_score = score_query(&build_search_record(&modded), &tokens, &compact, query)
+            .expect("modded must match");
+
+        assert!(vanilla_score > modded_score);
+    }
+
+    #[test]
+    fn folder_filter_matches_subtree() {
+        let asset = sample_asset(
+            "mod.sample.sample.textures.item.star.png",
+            AssetSourceType::Mod,
+            "sample-mod",
+            "sample",
+            "textures/item/star.png",
+        );
+
+        let index = build_search_record(&asset);
+        let folder = asset_folder_node_id(&asset);
+        let parent = folder
+            .split('/')
+            .take(4)
+            .collect::<Vec<_>>()
+            .join("/");
+
+        assert!(asset_matches_folder(&index, Some(&folder)));
+        assert!(asset_matches_folder(&index, Some(&parent)));
+        assert!(!asset_matches_folder(&index, Some("root/vanilla")));
+    }
+
+    fn sample_asset(
+        key: &str,
+        source_type: AssetSourceType,
+        source_name: &str,
+        namespace: &str,
+        relative_asset_path: &str,
+    ) -> AssetRecord {
+        AssetRecord {
+            asset_id: key.to_string(),
+            key: key.to_string(),
+            source_type,
+            source_name: source_name.to_string(),
+            namespace: namespace.to_string(),
+            relative_asset_path: relative_asset_path.to_string(),
+            extension: Path::new(relative_asset_path)
+                .extension()
+                .map(|value| value.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default(),
+            is_image: true,
+            is_audio: false,
+            container_path: "/tmp/container".to_string(),
+            container_type: AssetContainerType::Jar,
+            entry_path: format!("assets/{namespace}/{relative_asset_path}"),
+        }
     }
 }
