@@ -653,7 +653,7 @@ function App() {
           </div>
 
           <div className="field-group">
-            <label className="field-label">Include</label>
+            <div className="field-label">Include</div>
             <div className="field-row checkbox-row">
               <label className="mae-checkbox">
                 <input
