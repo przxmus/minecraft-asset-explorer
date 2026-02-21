@@ -119,6 +119,8 @@ function App() {
 
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [filterImages, setFilterImages] = useState(true);
+  const [filterAudio, setFilterAudio] = useState(true);
 
   const [treeByNodeId, setTreeByNodeId] = useState<Record<string, TreeNode[]>>({
     [ROOT_NODE_ID]: [],
@@ -153,6 +155,7 @@ function App() {
   const expandedNodesRef = useRef<Set<string>>(new Set());
   const autoScanTimeoutRef = useRef<number | null>(null);
   const listParentRef = useRef<HTMLDivElement | null>(null);
+  const previewContentRef = useRef<HTMLDivElement | null>(null);
 
   const selectedAssetIds = useMemo(() => Array.from(selectedAssets), [selectedAssets]);
 
@@ -281,6 +284,9 @@ function App() {
             folderNodeId: selectedFolderId,
             offset,
             limit: SEARCH_PAGE_SIZE,
+            includeImages: filterImages,
+            includeAudio: filterAudio,
+            includeOther: false,
           },
         });
 
@@ -305,7 +311,7 @@ function App() {
         }
       }
     },
-    [debouncedQuery, resetSearchState, selectedFolderId],
+    [debouncedQuery, filterAudio, filterImages, resetSearchState, selectedFolderId],
   );
 
   const startScan = useCallback(async () => {
@@ -674,6 +680,14 @@ function App() {
   }, [activeAsset, previewCache]);
 
   useEffect(() => {
+    if (!activeAssetId) {
+      return;
+    }
+
+    previewContentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  }, [activeAssetId]);
+
+  useEffect(() => {
     const registerListeners = async () => {
       const unlistenProgress = await listen<ScanProgressEvent>("scan://progress", (event) => {
         if (event.payload.scanId !== activeScanIdRef.current) {
@@ -739,6 +753,15 @@ function App() {
   }, [refreshVisibleTreeNodes]);
 
   const currentPreview = activeAsset ? previewCache[activeAsset.assetId] : undefined;
+  const isExplorerLocked = lifecycle !== "completed";
+  const activeAssetIsJson =
+    !!activeAsset &&
+    (activeAsset.extension.toLowerCase() === "json" ||
+      activeAsset.extension.toLowerCase() === "mcmeta");
+  const jsonPreviewText =
+    activeAsset && activeAssetIsJson && currentPreview
+      ? decodePreviewJson(currentPreview.base64)
+      : null;
 
   return (
     <div className="app-shell">
@@ -845,28 +868,60 @@ function App() {
             value={query}
             onChange={(event) => setQuery(event.currentTarget.value)}
             placeholder="Search: star, atm star, all the star, item star"
+            disabled={isExplorerLocked}
           />
 
           <select
             className="mae-select audio-select"
             value={audioFormat}
             onChange={(event) => setAudioFormat(event.currentTarget.value as AudioFormat)}
+            disabled={isExplorerLocked}
           >
             <option value="original">Audio: original</option>
             <option value="mp3">Audio: mp3</option>
             <option value="wav">Audio: wav</option>
           </select>
 
-          <button type="button" className="mae-button" onClick={selectAllVisible}>
+          <label className="mae-checkbox filter-pill">
+            <input
+              type="checkbox"
+              checked={filterImages}
+              onChange={(event) => setFilterImages(event.currentTarget.checked)}
+              disabled={isExplorerLocked}
+            />
+            Images
+          </label>
+
+          <label className="mae-checkbox filter-pill">
+            <input
+              type="checkbox"
+              checked={filterAudio}
+              onChange={(event) => setFilterAudio(event.currentTarget.checked)}
+              disabled={isExplorerLocked}
+            />
+            Audio
+          </label>
+
+          <button
+            type="button"
+            className="mae-button"
+            onClick={selectAllVisible}
+            disabled={isExplorerLocked}
+          >
             Select visible
           </button>
-          <button type="button" className="mae-button" onClick={clearSelection}>
+          <button
+            type="button"
+            className="mae-button"
+            onClick={clearSelection}
+            disabled={isExplorerLocked}
+          >
             Clear
           </button>
           <button
             type="button"
             className="mae-button"
-            disabled={isCopying || selectedAssetIds.length === 0}
+            disabled={isExplorerLocked || isCopying || selectedAssetIds.length === 0}
             onClick={() => {
               void copyAssets(selectedAssetIds);
             }}
@@ -876,7 +931,7 @@ function App() {
           <button
             type="button"
             className="mae-button mae-button-accent"
-            disabled={isSaving || selectedAssetIds.length === 0}
+            disabled={isExplorerLocked || isSaving || selectedAssetIds.length === 0}
             onClick={() => {
               void saveAssets(selectedAssetIds);
             }}
@@ -886,7 +941,7 @@ function App() {
         </div>
       </header>
 
-      <main className="content-grid">
+      <main className={`content-grid ${isExplorerLocked ? "content-grid-locked" : ""}`}>
         <aside className="tree-panel">
           <div className="panel-title">Explorer</div>
           <button
@@ -910,6 +965,9 @@ function App() {
             className="asset-list"
             ref={listParentRef}
             onScroll={() => {
+              if (isExplorerLocked) {
+                return;
+              }
               const element = listParentRef.current;
               if (!element || isSearchLoadingRef.current || !hasMoreSearchRef.current) {
                 return;
@@ -1027,7 +1085,7 @@ function App() {
                 <button
                   type="button"
                   className="mae-button"
-                  disabled={isSearchLoading}
+                  disabled={isExplorerLocked || isSearchLoading}
                   onClick={() => {
                     void fetchSearchPage(false);
                   }}
@@ -1044,7 +1102,7 @@ function App() {
           {!activeAsset ? (
             <p className="muted">Select an asset to see preview.</p>
           ) : (
-            <div className="preview-content">
+            <div className="preview-content" ref={previewContentRef}>
               <div className="preview-key">{activeAsset.key}</div>
               <div className="preview-meta">
                 {activeAsset.containerType} · {activeAsset.extension || "no-ext"}
@@ -1067,13 +1125,17 @@ function App() {
                 />
               ) : null}
 
+              {activeAssetIsJson && jsonPreviewText ? (
+                <pre className="json-preview">{renderHighlightedJson(jsonPreviewText)}</pre>
+              ) : null}
+
               {!currentPreview ? (
                 <div className="preview-fallback">Loading preview...</div>
               ) : null}
 
-              {!activeAsset.isImage && !activeAsset.isAudio ? (
+              {!activeAsset.isImage && !activeAsset.isAudio && !activeAssetIsJson ? (
                 <div className="preview-fallback">
-                  Preview is available for image and audio assets.
+                  Preview is available for image, audio and JSON assets.
                 </div>
               ) : null}
 
@@ -1100,9 +1162,83 @@ function App() {
             </div>
           )}
         </aside>
+
+        {isExplorerLocked ? (
+          <div className="content-overlay">
+            <div className="overlay-card">
+              <div className="overlay-title">Loading assets...</div>
+              <div className="overlay-subtitle">
+                Explorer will unlock automatically after scan completes.
+              </div>
+            </div>
+          </div>
+        ) : null}
       </main>
     </div>
   );
+}
+
+function decodePreviewJson(base64: string): string {
+  try {
+    const binary = atob(base64);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const raw = new TextDecoder().decode(bytes);
+    const parsed = JSON.parse(raw);
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return "Invalid JSON content.";
+  }
+}
+
+function renderHighlightedJson(value: string): ReactElement[] {
+  const tokenRegex =
+    /(\"(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\\"])*\"\\s*:?)|\\b(true|false|null)\\b|-?\\d+(?:\\.\\d+)?(?:[eE][+\\-]?\\d+)?/g;
+
+  const nodes: ReactElement[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null = tokenRegex.exec(value);
+  let key = 0;
+
+  while (match) {
+    const token = match[0];
+    const start = match.index;
+
+    if (start > lastIndex) {
+      nodes.push(
+        <span className="json-punctuation" key={`plain-${key++}`}>
+          {value.slice(lastIndex, start)}
+        </span>,
+      );
+    }
+
+    let className = "json-number";
+    if (/\"\\s*:$/.test(token)) {
+      className = "json-key";
+    } else if (token.startsWith('"')) {
+      className = "json-string";
+    } else if (/^(true|false|null)$/.test(token)) {
+      className = "json-literal";
+    }
+
+    nodes.push(
+      <span className={className} key={`tok-${key++}`}>
+        {token}
+      </span>,
+    );
+
+    lastIndex = start + token.length;
+    match = tokenRegex.exec(value);
+  }
+
+  if (lastIndex < value.length) {
+    nodes.push(
+      <span className="json-punctuation" key={`plain-${key++}`}>
+        {value.slice(lastIndex)}
+      </span>,
+    );
+  }
+
+  return nodes;
 }
 
 export default App;

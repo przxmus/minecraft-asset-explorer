@@ -95,6 +95,13 @@ body {
   color: var(--ink);
 }
 
+.filter-pill {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: rgba(18, 26, 41, 0.8);
+}
+
 .mae-input,
 .mae-select,
 .mae-search {
@@ -179,9 +186,14 @@ body {
 
 .content-grid {
   min-height: 0;
+  position: relative;
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr) 360px;
   gap: 12px;
+}
+
+.content-grid-locked {
+  user-select: none;
 }
 
 .tree-panel,
@@ -332,6 +344,40 @@ body {
   width: 100%;
 }
 
+.json-preview {
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  overflow: auto;
+  max-height: 44dvh;
+  background: rgba(8, 13, 23, 0.85);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.json-key {
+  color: #6fd6ff;
+}
+
+.json-string {
+  color: #b4ffa6;
+}
+
+.json-number {
+  color: #ffc97a;
+}
+
+.json-literal {
+  color: #ff9ac8;
+}
+
+.json-punctuation {
+  color: #d6e0f6;
+}
+
 .preview-fallback {
   border: 1px dashed var(--line);
   border-radius: 11px;
@@ -356,6 +402,36 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.content-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgba(4, 8, 14, 0.72);
+  backdrop-filter: blur(3px);
+}
+
+.overlay-card {
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  padding: 18px 20px;
+  background: rgba(9, 15, 24, 0.92);
+  box-shadow: var(--shadow);
+  max-width: 360px;
+}
+
+.overlay-title {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.overlay-subtitle {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--ink-muted);
 }
 
 @media (max-width: 1180px) {
