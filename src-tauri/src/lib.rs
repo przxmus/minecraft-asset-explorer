@@ -138,6 +138,7 @@ enum AssetContainerType {
     Directory,
     Zip,
     Jar,
+    AssetIndex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +245,9 @@ struct SearchRequest {
     offset: Option<usize>,
     limit: Option<usize>,
     folder_node_id: Option<String>,
+    include_images: Option<bool>,
+    include_audio: Option<bool>,
+    include_other: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -328,6 +332,28 @@ struct MmcPack {
 struct MmcComponent {
     uid: String,
     version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MinecraftMetaVersion {
+    asset_index: Option<MinecraftMetaAssetIndex>,
+    assets: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftMetaAssetIndex {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftAssetIndexFile {
+    objects: HashMap<String, MinecraftAssetIndexObject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinecraftAssetIndexObject {
+    hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -540,6 +566,9 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
 
     let offset = req.offset.unwrap_or(0);
     let limit = req.limit.unwrap_or(200).clamp(1, 1000);
+    let include_images = req.include_images.unwrap_or(true);
+    let include_audio = req.include_audio.unwrap_or(true);
+    let include_other = req.include_other.unwrap_or(true);
     let folder_filter = req
         .folder_node_id
         .as_deref()
@@ -554,6 +583,10 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
             let Some(index) = scan.search_index.get(&asset.asset_id) else {
                 continue;
             };
+
+            if !asset_matches_media(asset, include_images, include_audio, include_other) {
+                continue;
+            }
 
             if !asset_matches_folder(index, folder_filter) {
                 continue;
@@ -577,6 +610,10 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
         let Some(index) = scan.search_index.get(&asset.asset_id) else {
             continue;
         };
+
+        if !asset_matches_media(asset, include_images, include_audio, include_other) {
+            continue;
+        }
 
         if !asset_matches_folder(index, folder_filter) {
             continue;
@@ -616,8 +653,8 @@ fn get_asset_preview(
 ) -> Result<AssetPreviewResponse, String> {
     let asset = get_asset_from_state(&state, &scan_id, &asset_id)?;
 
-    if !asset.is_image && !asset.is_audio {
-        return Err("Preview is only available for image or audio assets".to_string());
+    if !asset.is_image && !asset.is_audio && !is_json_extension(&asset.extension) {
+        return Err("Preview is only available for image, audio or JSON assets".to_string());
     }
 
     let bytes = extract_asset_bytes(&asset)?;
@@ -1181,6 +1218,15 @@ fn collect_scan_containers(
                 container_path: client_jar,
             });
         }
+
+        if let Some(asset_index_path) = resolve_vanilla_asset_index_path(prism_root, mc_version) {
+            containers.push(ScanContainer {
+                source_type: AssetSourceType::Vanilla,
+                source_name: format!("minecraft-{mc_version}"),
+                container_type: AssetContainerType::AssetIndex,
+                container_path: asset_index_path,
+            });
+        }
     }
 
     Ok(containers)
@@ -1190,7 +1236,83 @@ fn scan_container(container: &ScanContainer) -> Result<Vec<AssetCandidate>, Stri
     match container.container_type {
         AssetContainerType::Directory => scan_directory_container(container),
         AssetContainerType::Zip | AssetContainerType::Jar => scan_archive_container(container),
+        AssetContainerType::AssetIndex => scan_vanilla_asset_index_container(container),
     }
+}
+
+fn scan_vanilla_asset_index_container(container: &ScanContainer) -> Result<Vec<AssetCandidate>, String> {
+    let content = fs::read_to_string(&container.container_path).map_err(|error| {
+        format!(
+            "Failed to read vanilla asset index {}: {error}",
+            container.container_path.display()
+        )
+    })?;
+
+    let parsed: MinecraftAssetIndexFile = serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "Failed to parse vanilla asset index {}: {error}",
+            container.container_path.display()
+        )
+    })?;
+
+    let assets_root = container
+        .container_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            format!(
+                "Invalid asset index path (cannot resolve assets root): {}",
+                container.container_path.display()
+            )
+        })?;
+    let objects_root = assets_root.join("objects");
+
+    let mut assets = Vec::new();
+    for (logical_path, object) in parsed.objects {
+        let Some((namespace, relative_asset_path)) = logical_path.split_once('/') else {
+            continue;
+        };
+
+        // Vanilla sounds are shipped via asset indexes/objects, not client jar entries.
+        if !relative_asset_path.starts_with("sounds/") {
+            continue;
+        }
+
+        let extension = relative_asset_path
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        if !is_audio_extension(&extension) {
+            continue;
+        }
+
+        if object.hash.len() < 2 {
+            continue;
+        }
+
+        let entry_path = format!("{}/{}", &object.hash[0..2], object.hash);
+        let absolute_path = objects_root.join(&entry_path);
+        if !absolute_path.is_file() {
+            continue;
+        }
+
+        assets.push(AssetCandidate {
+            source_type: container.source_type.clone(),
+            source_name: container.source_name.clone(),
+            namespace: namespace.to_string(),
+            relative_asset_path: relative_asset_path.to_string(),
+            container_path: objects_root.clone(),
+            container_type: AssetContainerType::Directory,
+            entry_path,
+            extension,
+            is_image: false,
+            is_audio: true,
+        });
+    }
+
+    Ok(assets)
 }
 
 fn scan_directory_container(container: &ScanContainer) -> Result<Vec<AssetCandidate>, String> {
@@ -1562,6 +1684,23 @@ fn asset_matches_folder(index: &AssetSearchRecord, folder_filter: Option<&str>) 
     index.folder_node_id == folder_filter || index.folder_node_id.starts_with(&format!("{folder_filter}/"))
 }
 
+fn asset_matches_media(
+    asset: &AssetRecord,
+    include_images: bool,
+    include_audio: bool,
+    include_other: bool,
+) -> bool {
+    if asset.is_image {
+        return include_images;
+    }
+
+    if asset.is_audio {
+        return include_audio;
+    }
+
+    include_other
+}
+
 fn add_asset_to_tree(tree_children: &mut HashMap<String, Vec<TreeNode>>, asset: &AssetRecord) {
     let mut parent_id = ROOT_NODE_ID.to_string();
     let folders = build_asset_folder_segments(asset);
@@ -1883,6 +2022,9 @@ fn extract_asset_bytes(asset: &AssetRecord) -> Result<Vec<u8>, String> {
             fs::read(&file_path)
                 .map_err(|error| format!("Failed to read file {}: {error}", file_path.display()))
         }
+        AssetContainerType::AssetIndex => Err(
+            "AssetIndex container type is metadata-only and cannot be extracted directly".to_string(),
+        ),
         AssetContainerType::Zip | AssetContainerType::Jar => {
             let file = fs::File::open(&container_path).map_err(|error| {
                 format!(
@@ -1929,6 +2071,7 @@ fn mime_for_extension(extension: &str) -> &'static str {
         "opus" => "audio/opus",
         "m4a" => "audio/mp4",
         "aac" => "audio/aac",
+        "json" | "mcmeta" => "application/json",
         _ => "application/octet-stream",
     }
 }
@@ -1945,6 +2088,10 @@ fn is_audio_extension(extension: &str) -> bool {
         extension,
         "ogg" | "wav" | "mp3" | "flac" | "m4a" | "aac" | "opus" | "oga"
     )
+}
+
+fn is_json_extension(extension: &str) -> bool {
+    matches!(extension, "json" | "mcmeta")
 }
 
 fn dedupe_candidates(candidates: Vec<PrismRootCandidate>) -> Result<Vec<PrismRootCandidate>, String> {
@@ -2069,6 +2216,31 @@ fn parse_minecraft_version(mmc_pack_path: &Path) -> Option<String> {
         .into_iter()
         .find(|component| component.uid == "net.minecraft")
         .and_then(|component| component.version)
+}
+
+fn resolve_vanilla_asset_index_path(prism_root: &Path, mc_version: &str) -> Option<PathBuf> {
+    let meta_path = prism_root
+        .join("meta")
+        .join("net.minecraft")
+        .join(format!("{mc_version}.json"));
+    let content = fs::read_to_string(meta_path).ok()?;
+    let parsed: MinecraftMetaVersion = serde_json::from_str(&content).ok()?;
+
+    let index_id = parsed
+        .asset_index
+        .map(|asset_index| asset_index.id)
+        .or(parsed.assets)?;
+
+    let index_path = prism_root
+        .join("assets")
+        .join("indexes")
+        .join(format!("{index_id}.json"));
+
+    if index_path.is_file() {
+        Some(index_path)
+    } else {
+        None
+    }
 }
 
 fn cleanup_temp_paths(state: &AppState) {
