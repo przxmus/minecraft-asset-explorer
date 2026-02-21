@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const mode = process.argv[2];
 const validModes = new Set(['linux', 'macos', 'windows', 'all']);
@@ -17,6 +19,9 @@ const hostToTarget = {
 
 const host = process.platform;
 const hostTarget = hostToTarget[host];
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(scriptDir, '..');
+const zigRunnerPath = resolve(repoRoot, 'scripts', 'tauri-zigbuild-runner.sh');
 
 if (!hostTarget) {
   console.error(`[build] Unsupported host platform: ${host}`);
@@ -42,6 +47,15 @@ function run(cmd, args) {
   return result.status === 0;
 }
 
+function runQuiet(cmd, args) {
+  const result = spawnSync(cmd, args, { stdio: 'pipe', encoding: 'utf8' });
+  return { ok: result.status === 0, stdout: result.stdout ?? '' };
+}
+
+function commandExists(cmd) {
+  return runQuiet('sh', ['-lc', `command -v ${cmd}`]).ok;
+}
+
 function listInstalledRustTargets() {
   const result = spawnSync('rustup', ['target', 'list', '--installed'], { encoding: 'utf8' });
   if (result.status !== 0) {
@@ -58,6 +72,52 @@ function listInstalledRustTargets() {
 }
 
 const installedRustTargets = listInstalledRustTargets();
+
+function platformForTriple(triple) {
+  if (triple.includes('apple-darwin')) return 'macos';
+  if (triple.includes('windows')) return 'windows';
+  if (triple.includes('linux')) return 'linux';
+  return 'unknown';
+}
+
+function ensureZigRunnerDeps() {
+  if (!commandExists('cargo-zigbuild')) {
+    console.log('[build] Installing cargo-zigbuild...');
+    const installed = run('cargo', ['install', 'cargo-zigbuild', '--locked']);
+    if (!installed) {
+      console.error('[build] Failed to install cargo-zigbuild.');
+      process.exit(1);
+    }
+  }
+
+  if (!commandExists('zig')) {
+    console.error('[build] zig is required for cross-target Linux/Windows builds via cargo-zigbuild.');
+    console.error('[build] Install zig (for example: brew install zig) and rerun.');
+    process.exit(1);
+  }
+}
+
+function ensureWindowsGnuTools() {
+  const required = ['x86_64-w64-mingw32-dlltool', 'x86_64-w64-mingw32-windres'];
+  const missing = required.filter((tool) => !commandExists(tool));
+  if (missing.length === 0) {
+    return true;
+  }
+
+  const autoInstall = process.env.BUILD_AUTO_INSTALL_TOOLCHAINS === '1';
+  if (autoInstall && commandExists('brew')) {
+    console.log('[build] Installing mingw-w64 via Homebrew for Windows GNU cross-build tooling...');
+    const installed = run('brew', ['install', 'mingw-w64']);
+    if (installed) {
+      return required.every((tool) => commandExists(tool));
+    }
+  }
+
+  console.error(`[build] Missing Windows GNU tools: ${missing.join(', ')}`);
+  console.error('[build] Install with: brew install mingw-w64');
+  console.error('[build] Or rerun with BUILD_AUTO_INSTALL_TOOLCHAINS=1 to auto-install.');
+  return false;
+}
 
 function resolveDefaultTargetTriple(target) {
   const preferred = preferredTargetTriples[target];
@@ -99,7 +159,25 @@ function buildTarget(target, { continueOnFailure = false } = {}) {
 
   for (const triple of triples) {
     console.log(`[build] Building ${target} release bundles for target ${triple}...`);
-    const ok = run('bunx', ['tauri', 'build', '--target', triple]);
+    const triplePlatform = platformForTriple(triple);
+    const useZigRunner = triplePlatform !== 'unknown' && triplePlatform !== hostTarget;
+    const buildArgs = ['tauri', 'build', '--target', triple];
+    if (useZigRunner) {
+      ensureZigRunnerDeps();
+      buildArgs.push('--runner', zigRunnerPath);
+    }
+    if (triple === 'x86_64-pc-windows-gnu' && host !== 'win32') {
+      const hasGnuTools = ensureWindowsGnuTools();
+      if (!hasGnuTools) {
+        if (continueOnFailure) {
+          console.error(`[build] ${target} build failed for ${triple}.`);
+          return false;
+        }
+        process.exit(1);
+      }
+    }
+
+    const ok = run('bunx', buildArgs);
     if (!ok) {
       if (target === 'windows' && host !== 'win32') {
         console.error('[build] Hint: set TAURI_TARGET_WINDOWS=x86_64-pc-windows-gnu if MSVC toolchain is missing.');
