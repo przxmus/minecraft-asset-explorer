@@ -5,7 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "bun run build:web",
+    "build:web": "tsc && vite build",
+    "build:linux": "node scripts/build-release.mjs linux",
+    "build:macos": "node scripts/build-release.mjs macos",
+    "build:windows": "node scripts/build-release.mjs windows",
+    "build:all": "node scripts/build-release.mjs all",
     "preview": "vite preview",
     "tauri": "tauri"
   },
