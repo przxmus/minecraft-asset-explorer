@@ -95,3 +95,14 @@ Build release bundles:
 ```bash
 bun run build:all
 ```
+
+Cross-target notes:
+
+- `build:all` attempts `macos`, `linux`, and `windows` builds from the current machine.
+- Cross-compiling requires installed Rust targets plus working linker/toolchain support for each target.
+- Override default Rust targets per platform with:
+  - `TAURI_TARGET_MACOS`
+  - `TAURI_TARGET_LINUX`
+  - `TAURI_TARGET_WINDOWS`
+  (comma-separated for multiple triples)
+- On macOS/Linux hosts, Windows builds prefer `x86_64-pc-windows-gnu` by default to avoid MSVC SDK requirements.

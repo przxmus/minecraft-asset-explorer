@@ -24,18 +24,17 @@ if (!hostTarget) {
 }
 
 const preferredTargetTriples = {
-  linux:
-    process.arch === 'arm64'
-      ? ['aarch64-unknown-linux-gnu', 'aarch64-unknown-linux-musl', 'x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl']
-      : ['x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-gnu', 'aarch64-unknown-linux-musl'],
+  linux: ['x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-gnu', 'aarch64-unknown-linux-musl'],
   macos:
     process.arch === 'arm64'
       ? ['aarch64-apple-darwin', 'x86_64-apple-darwin']
       : ['x86_64-apple-darwin', 'aarch64-apple-darwin'],
   windows:
-    process.arch === 'arm64'
-      ? ['aarch64-pc-windows-msvc', 'x86_64-pc-windows-msvc', 'x86_64-pc-windows-gnu']
-      : ['x86_64-pc-windows-msvc', 'x86_64-pc-windows-gnu', 'aarch64-pc-windows-msvc']
+    host === 'win32'
+      ? process.arch === 'arm64'
+        ? ['aarch64-pc-windows-msvc', 'x86_64-pc-windows-msvc', 'x86_64-pc-windows-gnu']
+        : ['x86_64-pc-windows-msvc', 'x86_64-pc-windows-gnu', 'aarch64-pc-windows-msvc']
+      : ['x86_64-pc-windows-gnu', 'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc']
 };
 
 function run(cmd, args) {
@@ -102,6 +101,12 @@ function buildTarget(target, { continueOnFailure = false } = {}) {
     console.log(`[build] Building ${target} release bundles for target ${triple}...`);
     const ok = run('bunx', ['tauri', 'build', '--target', triple]);
     if (!ok) {
+      if (target === 'windows' && host !== 'win32') {
+        console.error('[build] Hint: set TAURI_TARGET_WINDOWS=x86_64-pc-windows-gnu if MSVC toolchain is missing.');
+      }
+      if (target === 'linux' && host !== 'linux') {
+        console.error('[build] Hint: Linux cross-builds for Tauri need pkg-config/sysroot for GTK/WebKit (or a dedicated Linux build environment).');
+      }
       if (continueOnFailure) {
         console.error(`[build] ${target} build failed for ${triple}.`);
         return false;
