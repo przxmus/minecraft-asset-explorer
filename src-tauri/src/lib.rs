@@ -546,19 +546,25 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
         .filter(|value| !value.trim().is_empty() && *value != ROOT_NODE_ID);
 
     if req.query.trim().is_empty() {
-        let mut filtered = Vec::new();
+        let mut total = 0usize;
+        let mut assets = Vec::new();
+        let stop_at = offset.saturating_add(limit);
+
         for asset in &scan.assets {
             let Some(index) = scan.search_index.get(&asset.asset_id) else {
                 continue;
             };
 
-            if asset_matches_folder(index, folder_filter) {
-                filtered.push(asset.clone());
+            if !asset_matches_folder(index, folder_filter) {
+                continue;
             }
+
+            if total >= offset && total < stop_at {
+                assets.push(asset.clone());
+            }
+            total += 1;
         }
 
-        let total = filtered.len();
-        let assets = filtered.into_iter().skip(offset).take(limit).collect();
         return Ok(SearchResponse { total, assets });
     }
 
@@ -581,9 +587,17 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
         }
     }
 
-    ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.key.cmp(&right.1.key)));
-
     let total = ranked.len();
+    let wanted = offset.saturating_add(limit).max(1);
+    if ranked.len() > wanted {
+        ranked.select_nth_unstable_by(wanted - 1, |left, right| {
+            right.0.cmp(&left.0).then(left.1.key.cmp(&right.1.key))
+        });
+        ranked.truncate(wanted);
+    }
+
+    ranked.sort_unstable_by(|left, right| right.0.cmp(&left.0).then(left.1.key.cmp(&right.1.key)));
+
     let assets = ranked
         .into_iter()
         .skip(offset)
