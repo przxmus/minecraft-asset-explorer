@@ -4,8 +4,6 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type CSSProperties,
-  type KeyboardEvent,
-  type MouseEvent,
   type ReactElement,
   useCallback,
   useDeferredValue,
@@ -14,84 +12,29 @@ import {
   useRef,
   useState,
 } from "react";
+import {
+  AssetListPanel,
+  ContentOverlay,
+  PreviewPanel,
+  StatusStrip,
+  TopBar,
+  TreePanel,
+} from "./components";
+import type {
+  AssetPreviewResponse,
+  AssetRecord,
+  AudioFormat,
+  InstanceInfo,
+  PrismRootCandidate,
+  ScanCompletedEvent,
+  ScanLifecycle,
+  ScanProgressEvent,
+  SearchResponse,
+  SelectionModifiers,
+  TreeNode,
+} from "./types/assets";
+import { decodePreviewJson, renderHighlightedJson } from "./utils/jsonPreview";
 import "./App.css";
-
-type PrismRootCandidate = {
-  path: string;
-  exists: boolean;
-  valid: boolean;
-  source: string;
-};
-
-type InstanceInfo = {
-  folderName: string;
-  displayName: string;
-  path: string;
-  minecraftVersion: string | null;
-};
-
-type AssetSourceType = "vanilla" | "mod" | "resourcePack";
-type AssetContainerType = "directory" | "zip" | "jar";
-
-type AssetRecord = {
-  assetId: string;
-  key: string;
-  sourceType: AssetSourceType;
-  sourceName: string;
-  namespace: string;
-  relativeAssetPath: string;
-  extension: string;
-  isImage: boolean;
-  isAudio: boolean;
-  containerPath: string;
-  containerType: AssetContainerType;
-  entryPath: string;
-};
-
-type ScanLifecycle = "scanning" | "completed" | "cancelled" | "error";
-
-type TreeNodeType = "folder" | "file";
-
-type TreeNode = {
-  id: string;
-  name: string;
-  nodeType: TreeNodeType;
-  hasChildren: boolean;
-  assetId: string | null;
-};
-
-type ScanProgressEvent = {
-  scanId: string;
-  scannedContainers: number;
-  totalContainers: number;
-  assetCount: number;
-  currentSource?: string;
-};
-
-type ScanCompletedEvent = {
-  scanId: string;
-  lifecycle: ScanLifecycle;
-  assetCount: number;
-  error?: string;
-};
-
-type AssetPreviewResponse = {
-  mime: string;
-  base64: string;
-};
-
-type AudioFormat = "original" | "mp3" | "wav";
-
-type SearchResponse = {
-  total: number;
-  assets: AssetRecord[];
-};
-
-type SelectionModifiers = {
-  shiftKey: boolean;
-  metaKey: boolean;
-  ctrlKey: boolean;
-};
 
 const ROOT_NODE_ID = "root";
 const SEARCH_PAGE_SIZE = 320;
@@ -848,530 +791,125 @@ function App() {
           ? "status-dot--error"
           : "";
 
+  const handleAssetListScroll = useCallback(() => {
+    if (isExplorerLocked) {
+      return;
+    }
+
+    const element = listParentRef.current;
+    if (!element || isSearchLoadingRef.current || !hasMoreSearchRef.current) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - searchScrollThrottleRef.current < 120) {
+      return;
+    }
+    searchScrollThrottleRef.current = now;
+
+    const distanceToBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
+    if (distanceToBottom < 260) {
+      void fetchSearchPage(false);
+    }
+  }, [fetchSearchPage, isExplorerLocked]);
+
   return (
     <div className="app-shell" style={appShellStyle}>
-      {/* ── header ────────────────────────────────────────── */}
       <header className="topbar" ref={topbarRef}>
-        {/* row 1: config */}
-        <div className="topbar-config">
-          <div className="field-group field-group--root">
-            <label className="field-label" htmlFor="prism-root-input">
-              Prism Root
-            </label>
-            <input
-              id="prism-root-input"
-              className="mae-input"
-              placeholder="/path/to/PrismLauncher"
-              value={prismRootInput}
-              onChange={(event) => setPrismRootInput(event.currentTarget.value)}
-              onBlur={() => commitPrismRoot(prismRootInput)}
-              onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
-                if (event.key === "Enter") {
-                  commitPrismRoot(prismRootInput);
-                }
-              }}
-            />
-          </div>
-
-          <div className="field-group field-group--instance">
-            <label className="field-label" htmlFor="instance-select">
-              Instance
-            </label>
-            <select
-              id="instance-select"
-              className="mae-select"
-              value={selectedInstance}
-              onChange={(event) => setSelectedInstance(event.currentTarget.value)}
-            >
-              <option value="">Select instance...</option>
-              {instances.map((instance) => (
-                <option key={instance.folderName} value={instance.folderName}>
-                  {instance.displayName}
-                  {instance.minecraftVersion ? ` (MC ${instance.minecraftVersion})` : ""}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="field-group field-group--sources">
-            <div className="field-label">Sources</div>
-            <div className="source-checks">
-              <label className="source-check">
-                <input
-                  type="checkbox"
-                  checked={includeVanilla}
-                  onChange={(event) => setIncludeVanilla(event.currentTarget.checked)}
-                />
-                Vanilla
-              </label>
-              <label className="source-check">
-                <input
-                  type="checkbox"
-                  checked={includeMods}
-                  onChange={(event) => setIncludeMods(event.currentTarget.checked)}
-                />
-                Mods
-              </label>
-              <label className="source-check">
-                <input
-                  type="checkbox"
-                  checked={includeResourcepacks}
-                  onChange={(event) => setIncludeResourcepacks(event.currentTarget.checked)}
-                />
-                Packs
-              </label>
-            </div>
-          </div>
-        </div>
-
-        {/* row 2: toolbar (search + filters + actions) */}
-        <div className="toolbar">
-          <input
-            className="mae-search toolbar-search"
-            value={query}
-            onChange={(event) => setQuery(event.currentTarget.value)}
-            placeholder="Search assets..."
-            disabled={isExplorerLocked}
-          />
-
-          <div className="toolbar-divider" />
-
-          <div className="toolbar-filters">
-            <label className="filter-pill">
-              <input
-                type="checkbox"
-                checked={filterImages}
-                onChange={(event) => setFilterImages(event.currentTarget.checked)}
-                disabled={isExplorerLocked}
-              />
-              Images
-            </label>
-            <label className="filter-pill">
-              <input
-                type="checkbox"
-                checked={filterAudio}
-                onChange={(event) => setFilterAudio(event.currentTarget.checked)}
-                disabled={isExplorerLocked}
-              />
-              Audio
-            </label>
-            <label className="filter-pill">
-              <input
-                type="checkbox"
-                checked={filterOther}
-                onChange={(event) => setFilterOther(event.currentTarget.checked)}
-                disabled={isExplorerLocked}
-              />
-              Other
-            </label>
-
-            <select
-              className="mae-select audio-select"
-              value={audioFormat}
-              onChange={(event) => setAudioFormat(event.currentTarget.value as AudioFormat)}
-              disabled={isExplorerLocked}
-            >
-              <option value="original">Original</option>
-              <option value="mp3">MP3</option>
-              <option value="wav">WAV</option>
-            </select>
-          </div>
-
-          <div className="toolbar-divider" />
-
-          <div className="toolbar-actions">
-            <button
-              type="button"
-              className="mae-button mae-button-sm"
-              onClick={selectAllVisible}
-              disabled={isExplorerLocked}
-            >
-              Select all
-            </button>
-            <button
-              type="button"
-              className="mae-button mae-button-sm"
-              onClick={clearSelection}
-              disabled={isExplorerLocked || selectedAssetIds.length === 0}
-            >
-              Clear
-            </button>
-
-            <div className="toolbar-divider" />
-
-            <button
-              type="button"
-              className="mae-button"
-              disabled={isExplorerLocked || isCopying || selectedAssetIds.length === 0}
-              onClick={() => {
-                void copyAssets(selectedAssetIds);
-              }}
-            >
-              {isCopying ? "Copying..." : `Copy (${selectedAssetIds.length})`}
-            </button>
-            <button
-              type="button"
-              className="mae-button mae-button-accent"
-              disabled={isExplorerLocked || isSaving || selectedAssetIds.length === 0}
-              onClick={() => {
-                void saveAssets(selectedAssetIds);
-              }}
-            >
-              {isSaving ? "Saving..." : `Save (${selectedAssetIds.length})`}
-            </button>
-          </div>
-        </div>
-
-        {/* row 3: status strip */}
-        <div className="status-strip">
-          <span className="status-strip__lifecycle">
-            <span className={`status-dot ${lifecycleDotClass}`} />
-            {lifecycle}
-          </span>
-
-          {progress ? (
-            <>
-              <div className="progress-bar">
-                <div
-                  className="progress-bar__fill"
-                  style={{ width: `${progressPercent}%` }}
-                />
-              </div>
-              <span className="status-strip__progress">
-                {progress.scannedContainers}/{progress.totalContainers} containers
-                &middot; {progress.assetCount} assets
-              </span>
-            </>
-          ) : null}
-
-          <span className="status-strip__message">{statusLine}</span>
-        </div>
+        <TopBar
+          prismRootInput={prismRootInput}
+          onPrismRootInputChange={setPrismRootInput}
+          onCommitPrismRoot={() => commitPrismRoot(prismRootInput)}
+          instances={instances}
+          selectedInstance={selectedInstance}
+          onSelectedInstanceChange={setSelectedInstance}
+          includeVanilla={includeVanilla}
+          onIncludeVanillaChange={setIncludeVanilla}
+          includeMods={includeMods}
+          onIncludeModsChange={setIncludeMods}
+          includeResourcepacks={includeResourcepacks}
+          onIncludeResourcepacksChange={setIncludeResourcepacks}
+          query={query}
+          onQueryChange={setQuery}
+          filterImages={filterImages}
+          onFilterImagesChange={setFilterImages}
+          filterAudio={filterAudio}
+          onFilterAudioChange={setFilterAudio}
+          filterOther={filterOther}
+          onFilterOtherChange={setFilterOther}
+          audioFormat={audioFormat}
+          onAudioFormatChange={setAudioFormat}
+          isExplorerLocked={isExplorerLocked}
+          selectedAssetCount={selectedAssetIds.length}
+          isCopying={isCopying}
+          isSaving={isSaving}
+          onSelectAllVisible={selectAllVisible}
+          onClearSelection={clearSelection}
+          onCopySelection={() => {
+            void copyAssets(selectedAssetIds);
+          }}
+          onSaveSelection={() => {
+            void saveAssets(selectedAssetIds);
+          }}
+        />
+        <StatusStrip
+          lifecycle={lifecycle}
+          lifecycleDotClass={lifecycleDotClass}
+          progress={progress}
+          progressPercent={progressPercent}
+          statusLine={statusLine}
+        />
       </header>
 
-      {/* ── main content ──────────────────────────────────── */}
       <main className={`content-grid ${isExplorerLocked ? "content-grid-locked" : ""}`}>
-        {/* tree sidebar */}
-        <aside className="tree-panel">
-          <div className="panel-header">
-            <span className="panel-title">Explorer</span>
-          </div>
-          <button
-            type="button"
-            className={`tree-row ${selectedFolderId === ROOT_NODE_ID ? "tree-row-active" : ""}`}
-            style={{ paddingInlineStart: "14px" }}
-            onClick={() => setSelectedFolderId(ROOT_NODE_ID)}
-          >
-            <span className="tree-icon">&#x25BE;</span>
-            <span>All assets</span>
-          </button>
-          <div className="tree-scroll">{renderedTree}</div>
-        </aside>
-
-        {/* asset list */}
-        <section className="list-panel">
-          <div className="panel-header">
-            <span className="panel-title">Assets</span>
-            <span className="panel-subtitle">
-              {assets.length}/{searchTotal}
-              {isSearchLoading ? " loading..." : ""}
-            </span>
-          </div>
-
-          <div
-            className="asset-list"
-            ref={listParentRef}
-            onScroll={() => {
-              if (isExplorerLocked) {
-                return;
-              }
-              const element = listParentRef.current;
-              if (!element || isSearchLoadingRef.current || !hasMoreSearchRef.current) {
-                return;
-              }
-
-              const now = Date.now();
-              if (now - searchScrollThrottleRef.current < 120) {
-                return;
-              }
-              searchScrollThrottleRef.current = now;
-
-              const distanceToBottom =
-                element.scrollHeight - element.scrollTop - element.clientHeight;
-              if (distanceToBottom < 260) {
-                void fetchSearchPage(false);
-              }
-            }}
-          >
-            <div
-              style={{
-                height: `${virtualizer.getTotalSize()}px`,
-                position: "relative",
-                width: "100%",
-              }}
-            >
-              {virtualizer.getVirtualItems().map((virtualRow) => {
-                const asset = assets[virtualRow.index];
-                const isSelected = selectedAssets.has(asset.assetId);
-
-                const rowStyle: CSSProperties = {
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  transform: `translateY(${virtualRow.start}px)`,
-                  height: `${virtualRow.size}px`,
-                  width: "100%",
-                };
-
-                return (
-                  <div
-                    key={asset.assetId}
-                    className={`asset-row ${isSelected ? "asset-row-selected" : ""}`}
-                    style={rowStyle}
-                    role="button"
-                    tabIndex={0}
-                    onClick={(event: MouseEvent<HTMLDivElement>) => {
-                      applySelection(asset.assetId, {
-                        shiftKey: event.shiftKey,
-                        metaKey: event.metaKey,
-                        ctrlKey: event.ctrlKey,
-                      });
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key !== "Enter" && event.key !== " ") {
-                        return;
-                      }
-
-                      event.preventDefault();
-                      applySelection(asset.assetId, {
-                        shiftKey: event.shiftKey,
-                        metaKey: event.metaKey,
-                        ctrlKey: event.ctrlKey,
-                      });
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      readOnly
-                      checked={isSelected}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        applySelection(asset.assetId, {
-                          shiftKey: event.shiftKey,
-                          metaKey: event.metaKey,
-                          ctrlKey: event.ctrlKey,
-                        });
-                      }}
-                    />
-
-                    <button type="button" className="asset-main">
-                      <span className="asset-title">{asset.key}</span>
-                      <span className="asset-subtitle">
-                        {asset.sourceName} / {asset.namespace} / {asset.relativeAssetPath}
-                      </span>
-                    </button>
-
-                    <div className="asset-row-actions">
-                      <button
-                        type="button"
-                        className="mae-button mae-button-sm"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void copyAssets([asset.assetId]);
-                        }}
-                      >
-                        Copy
-                      </button>
-                      <button
-                        type="button"
-                        className="mae-button mae-button-sm"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void saveAssets([asset.assetId]);
-                        }}
-                      >
-                        Save
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            {hasMoreSearch ? (
-              <div className="load-more-wrap">
-                <button
-                  type="button"
-                  className="mae-button"
-                  disabled={isExplorerLocked || isSearchLoading}
-                  onClick={() => {
-                    void fetchSearchPage(false);
-                  }}
-                >
-                  {isSearchLoading ? "Loading..." : "Load more"}
-                </button>
-              </div>
-            ) : null}
-          </div>
-        </section>
-
-        {/* preview panel */}
-        <aside className="preview-panel" ref={previewPanelRef}>
-          <div className="panel-header">
-            <span className="panel-title">Preview</span>
-          </div>
-
-          {!activeAsset ? (
-            <div className="preview-empty">
-              Select an asset to preview
-            </div>
-          ) : (
-            <div className="preview-content" ref={previewContentRef}>
-              <div className="preview-key">{activeAsset.key}</div>
-              <div className="preview-meta">
-                <span className="preview-tag">{activeAsset.sourceType}</span>
-                <span className="preview-tag">{activeAsset.containerType}</span>
-                <span className="preview-tag">.{activeAsset.extension || "?"}</span>
-              </div>
-
-              {activeAsset.isImage && currentPreview ? (
-                <img
-                  className="preview-image"
-                  src={`data:${currentPreview.mime};base64,${currentPreview.base64}`}
-                  alt={activeAsset.key}
-                />
-              ) : null}
-
-              {activeAsset.isAudio && currentPreview ? (
-                <audio
-                  className="preview-audio"
-                  controls
-                  preload="metadata"
-                  src={`data:${currentPreview.mime};base64,${currentPreview.base64}`}
-                />
-              ) : null}
-
-              {activeAssetIsJson && highlightedJson ? (
-                <pre className="json-preview">{highlightedJson}</pre>
-              ) : null}
-
-              {!currentPreview &&
-                (activeAsset.isImage || activeAsset.isAudio || activeAssetIsJson) ? (
-                <div className="preview-fallback">Loading preview...</div>
-              ) : null}
-
-              {!activeAsset.isImage && !activeAsset.isAudio && !activeAssetIsJson ? (
-                <div className="preview-fallback">
-                  Preview available for images, audio, and JSON.
-                </div>
-              ) : null}
-
-              <div className="preview-actions">
-                <button
-                  type="button"
-                  className="mae-button"
-                  onClick={() => {
-                    void copyAssets([activeAsset.assetId]);
-                  }}
-                >
-                  Copy file
-                </button>
-                <button
-                  type="button"
-                  className="mae-button mae-button-accent"
-                  onClick={() => {
-                    void saveAssets([activeAsset.assetId]);
-                  }}
-                >
-                  Save file
-                </button>
-              </div>
-            </div>
-          )}
-        </aside>
-
-        {/* locked overlay */}
+        <TreePanel
+          selectedFolderId={selectedFolderId}
+          rootNodeId={ROOT_NODE_ID}
+          renderedTree={renderedTree}
+          onSelectRootFolder={() => setSelectedFolderId(ROOT_NODE_ID)}
+        />
+        <AssetListPanel
+          assets={assets}
+          searchTotal={searchTotal}
+          isSearchLoading={isSearchLoading}
+          hasMoreSearch={hasMoreSearch}
+          isExplorerLocked={isExplorerLocked}
+          selectedAssets={selectedAssets}
+          virtualTotalSize={virtualizer.getTotalSize()}
+          virtualItems={virtualizer.getVirtualItems()}
+          listParentRef={listParentRef}
+          onListScroll={handleAssetListScroll}
+          onApplySelection={applySelection}
+          onCopyAsset={(assetId) => {
+            void copyAssets([assetId]);
+          }}
+          onSaveAsset={(assetId) => {
+            void saveAssets([assetId]);
+          }}
+          onLoadMore={() => {
+            void fetchSearchPage(false);
+          }}
+        />
+        <PreviewPanel
+          activeAsset={activeAsset}
+          currentPreview={currentPreview}
+          activeAssetIsJson={activeAssetIsJson}
+          highlightedJson={highlightedJson}
+          previewPanelRef={previewPanelRef}
+          previewContentRef={previewContentRef}
+          onCopyActiveAsset={(assetId) => {
+            void copyAssets([assetId]);
+          }}
+          onSaveActiveAsset={(assetId) => {
+            void saveAssets([assetId]);
+          }}
+        />
         {isExplorerLocked ? (
-          <div className="content-overlay">
-            <div className="overlay-card">
-              <div className="overlay-title">
-                {needsInstanceSelection ? "Choose an instance" : "Scanning assets..."}
-              </div>
-              <div className="overlay-subtitle">
-                {needsInstanceSelection
-                  ? instances.length === 0
-                    ? "No instances found. Check your Prism root path."
-                    : "Select an instance above to start exploring."
-                  : "The explorer will unlock when the scan completes."}
-              </div>
-            </div>
-          </div>
+          <ContentOverlay needsInstanceSelection={needsInstanceSelection} instances={instances} />
         ) : null}
       </main>
     </div>
   );
-}
-
-function decodePreviewJson(base64: string): string {
-  try {
-    const binary = atob(base64);
-    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
-    const raw = new TextDecoder().decode(bytes);
-    const parsed = JSON.parse(raw);
-    return JSON.stringify(parsed, null, 2);
-  } catch {
-    return "Invalid JSON content.";
-  }
-}
-
-function renderHighlightedJson(value: string): ReactElement[] {
-  const tokenRegex =
-    /(\"(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\\"])*\"\\s*:?)|\\b(true|false|null)\\b|-?\\d+(?:\\.\\d+)?(?:[eE][+\\-]?\\d+)?/g;
-
-  const nodes: ReactElement[] = [];
-  let lastIndex = 0;
-  let match: RegExpExecArray | null = tokenRegex.exec(value);
-  let key = 0;
-
-  while (match) {
-    const token = match[0];
-    const start = match.index;
-
-    if (start > lastIndex) {
-      nodes.push(
-        <span className="json-punctuation" key={`plain-${key++}`}>
-          {value.slice(lastIndex, start)}
-        </span>,
-      );
-    }
-
-    let className = "json-number";
-    if (/\"\\s*:$/.test(token)) {
-      className = "json-key";
-    } else if (token.startsWith('"')) {
-      className = "json-string";
-    } else if (/^(true|false|null)$/.test(token)) {
-      className = "json-literal";
-    }
-
-    nodes.push(
-      <span className={className} key={`tok-${key++}`}>
-        {token}
-      </span>,
-    );
-
-    lastIndex = start + token.length;
-    match = tokenRegex.exec(value);
-  }
-
-  if (lastIndex < value.length) {
-    nodes.push(
-      <span className="json-punctuation" key={`plain-${key++}`}>
-        {value.slice(lastIndex)}
-      </span>,
-    );
-  }
-
-  return nodes;
 }
 
 export default App;
