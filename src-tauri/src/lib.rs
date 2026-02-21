@@ -39,7 +39,6 @@ struct ScanState {
     assets: Vec<AssetRecord>,
     asset_index: HashMap<String, usize>,
     search_records: Vec<AssetSearchRecord>,
-    search_cache: Option<CachedSearchResults>,
     tree_children: HashMap<String, Vec<TreeNode>>,
     last_progress_emit_at: Option<Instant>,
 }
@@ -58,7 +57,6 @@ impl ScanState {
             assets: Vec::new(),
             asset_index: HashMap::new(),
             search_records: Vec::new(),
-            search_cache: None,
             tree_children,
             last_progress_emit_at: None,
         }
@@ -88,12 +86,6 @@ struct AssetSearchRecord {
     compact_filename_stem: String,
     key: String,
     folder_node_id: String,
-}
-
-#[derive(Debug, Clone)]
-struct CachedSearchResults {
-    signature: String,
-    ordered_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,13 +570,13 @@ fn list_tree_children(
 
 #[tauri::command]
 fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<SearchResponse, String> {
-    let mut scans = state
+    let scans = state
         .scans
         .lock()
         .map_err(|_| "Failed to lock scans state".to_string())?;
 
     let scan = scans
-        .get_mut(&req.scan_id)
+        .get(&req.scan_id)
         .ok_or_else(|| format!("Unknown scan id: {}", req.scan_id))?;
 
     let offset = req.offset.unwrap_or(0);
@@ -599,13 +591,6 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
     let query_tokens = split_tokens(&req.query);
     let query_compact = compact_text(&req.query);
     let normalized_query = query_tokens.join(" ");
-    let signature = build_search_signature(
-        &normalized_query,
-        folder_filter,
-        include_images,
-        include_audio,
-        include_other,
-    );
 
     if !(include_images || include_audio || include_other) {
         return Ok(SearchResponse {
@@ -614,80 +599,75 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
         });
     }
 
-    let needs_rebuild = scan
-        .search_cache
-        .as_ref()
-        .map(|cache| cache.signature.as_str() != signature)
-        .unwrap_or(true);
+    if query_tokens.is_empty() {
+        let mut total = 0usize;
+        let mut assets = Vec::new();
+        let stop_at = offset.saturating_add(limit);
 
-    if needs_rebuild {
-        let ordered_indices = if query_tokens.is_empty() {
-            let mut results = Vec::new();
-
-            for (index, asset) in scan.assets.iter().enumerate() {
-                if !asset_matches_media(asset, include_images, include_audio, include_other) {
-                    continue;
-                }
-
-                let search_record = &scan.search_records[index];
-                if !asset_matches_folder(search_record, folder_filter) {
-                    continue;
-                }
-
-                results.push(index);
+        for (index, asset) in scan.assets.iter().enumerate() {
+            if !asset_matches_media(asset, include_images, include_audio, include_other) {
+                continue;
             }
 
-            results
-        } else {
-            let mut ranked = Vec::new();
-
-            for (index, asset) in scan.assets.iter().enumerate() {
-                if !asset_matches_media(asset, include_images, include_audio, include_other) {
-                    continue;
-                }
-
-                let search_record = &scan.search_records[index];
-                if !asset_matches_folder(search_record, folder_filter) {
-                    continue;
-                }
-
-                if let Some(score) = score_query(
-                    search_record,
-                    &query_tokens,
-                    &query_compact,
-                    &normalized_query,
-                ) {
-                    ranked.push((score, index));
-                }
+            let search_record = &scan.search_records[index];
+            if !asset_matches_folder(search_record, folder_filter) {
+                continue;
             }
 
-            ranked.sort_unstable_by(|left, right| {
-                right
-                    .0
-                    .cmp(&left.0)
-                    .then_with(|| scan.assets[left.1].key.cmp(&scan.assets[right.1].key))
-            });
+            if total >= offset && total < stop_at {
+                assets.push(asset.clone());
+            }
+            total += 1;
+        }
 
-            ranked.into_iter().map(|(_, index)| index).collect()
-        };
-
-        scan.search_cache = Some(CachedSearchResults {
-            signature,
-            ordered_indices,
-        });
+        return Ok(SearchResponse { total, assets });
     }
 
-    let ordered_indices = &scan
-        .search_cache
-        .as_ref()
-        .ok_or_else(|| "Search cache is missing".to_string())?
-        .ordered_indices;
-    let total = ordered_indices.len();
-    let assets = ordered_indices
+    let mut ranked = Vec::new();
+    for (index, asset) in scan.assets.iter().enumerate() {
+        if !asset_matches_media(asset, include_images, include_audio, include_other) {
+            continue;
+        }
+
+        let search_record = &scan.search_records[index];
+        if !asset_matches_folder(search_record, folder_filter) {
+            continue;
+        }
+
+        if let Some(score) = score_query(
+            search_record,
+            &query_tokens,
+            &query_compact,
+            &normalized_query,
+        ) {
+            ranked.push((score, index));
+        }
+    }
+
+    let total = ranked.len();
+    let wanted = offset.saturating_add(limit).max(1);
+    if ranked.len() > wanted {
+        ranked.select_nth_unstable_by(wanted - 1, |left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| scan.assets[left.1].key.cmp(&scan.assets[right.1].key))
+        });
+        ranked.truncate(wanted);
+    }
+
+    ranked.sort_unstable_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| scan.assets[left.1].key.cmp(&scan.assets[right.1].key))
+    });
+
+    let assets = ranked
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|index| scan.assets[*index].clone())
+        .map(|(_, index)| scan.assets[index].clone())
         .collect();
 
     Ok(SearchResponse { total, assets })
@@ -1047,10 +1027,6 @@ fn append_assets_chunk(
             scan.assets.push(asset.clone());
             inserted_assets.push(asset.clone());
             add_asset_to_tree(&mut scan.tree_children, asset);
-        }
-
-        if !inserted_assets.is_empty() {
-            scan.search_cache = None;
         }
 
         let now = Instant::now();
@@ -1680,41 +1656,51 @@ fn score_query(
     for query_token in query_tokens {
         let mut token_score = 0i64;
 
-        token_score = token_score.max(score_token_group(
+        token_score = token_score.max(score_token_group_fast(
             &index.filename_tokens,
             query_token,
             320,
             250,
             180,
         ));
-        token_score = token_score.max(score_token_group(
+        token_score = token_score.max(score_token_group_fast(
             &index.path_tokens,
             query_token,
             170,
             130,
             95,
         ));
-        token_score = token_score.max(score_token_group(
+        token_score = token_score.max(score_token_group_fast(
             &index.namespace_tokens,
             query_token,
             140,
             110,
             80,
         ));
-        token_score = token_score.max(score_token_group(
+        token_score = token_score.max(score_token_group_fast(
             &index.source_tokens,
             query_token,
             130,
             100,
             76,
         ));
-        token_score = token_score.max(score_token_group(
+        token_score = token_score.max(score_token_group_fast(
             &index.all_tokens,
             query_token,
             100,
             80,
             60,
         ));
+
+        if token_score == 0 {
+            token_score = token_score.max(score_fuzzy_token_group(
+                &index.filename_tokens,
+                query_token,
+                72,
+            ));
+            token_score =
+                token_score.max(score_fuzzy_token_group(&index.path_tokens, query_token, 48));
+        }
 
         if token_score == 0 {
             score -= 100;
@@ -1771,7 +1757,7 @@ fn score_query(
     Some(score)
 }
 
-fn score_token_group(
+fn score_token_group_fast(
     tokens: &[String],
     query_token: &str,
     exact_weight: i64,
@@ -1781,15 +1767,29 @@ fn score_token_group(
     let mut best = 0;
     for token in tokens {
         if token == query_token {
-            best = best.max(exact_weight);
+            return exact_weight;
         } else if token.starts_with(query_token) || query_token.starts_with(token) {
             best = best.max(prefix_weight);
         } else if token.contains(query_token) || query_token.contains(token) {
             best = best.max(contains_weight);
-        } else {
-            best = best.max(score_fuzzy_token(token, query_token));
         }
     }
+    best
+}
+
+fn score_fuzzy_token_group(tokens: &[String], query_token: &str, max_weight: i64) -> i64 {
+    if query_token.len() < 4 {
+        return 0;
+    }
+
+    let mut best = 0i64;
+    for token in tokens {
+        let score = score_fuzzy_token(token, query_token);
+        if score > 0 {
+            best = best.max(max_weight.min(score));
+        }
+    }
+
     best
 }
 
@@ -1800,33 +1800,29 @@ fn score_fuzzy_token(token: &str, query_token: &str) -> i64 {
         return 0;
     }
 
-    let max_len = token_len.max(query_len);
     let len_delta = token_len.abs_diff(query_len);
-    if len_delta > 3 {
+    if len_delta > 2 {
+        return 0;
+    }
+
+    let token_bytes = token.as_bytes();
+    let query_bytes = query_token.as_bytes();
+    let same_start = token_bytes.first() == query_bytes.first();
+    let swap_start = token_bytes.len() > 1
+        && query_bytes.len() > 1
+        && token_bytes[0] == query_bytes[1]
+        && token_bytes[1] == query_bytes[0];
+    if !same_start && !swap_start {
         return 0;
     }
 
     let distance = damerau_levenshtein(token, query_token);
-
-    match (distance, max_len) {
-        (1, 4..) => 72,
-        (2, 4..) => 54,
-        (3, 9..) => 40,
+    match distance {
+        1 => 72,
+        2 if token_len >= 4 && query_len >= 4 => 54,
+        3 if token_len >= 9 && query_len >= 9 => 40,
         _ => 0,
     }
-}
-
-fn build_search_signature(
-    normalized_query: &str,
-    folder_filter: Option<&str>,
-    include_images: bool,
-    include_audio: bool,
-    include_other: bool,
-) -> String {
-    format!(
-        "q={normalized_query}|f={}|i={include_images}|a={include_audio}|o={include_other}",
-        folder_filter.unwrap_or(ROOT_NODE_ID)
-    )
 }
 
 fn asset_matches_folder(index: &AssetSearchRecord, folder_filter: Option<&str>) -> bool {
