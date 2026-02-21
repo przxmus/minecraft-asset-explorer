@@ -953,7 +953,21 @@ function App() {
                     key={asset.assetId}
                     className={`asset-row ${isSelected ? "asset-row-selected" : ""}`}
                     style={rowStyle}
+                    role="button"
+                    tabIndex={0}
                     onClick={(event: MouseEvent<HTMLDivElement>) => {
+                      applySelection(asset.assetId, {
+                        shiftKey: event.shiftKey,
+                        metaKey: event.metaKey,
+                        ctrlKey: event.ctrlKey,
+                      });
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" && event.key !== " ") {
+                        return;
+                      }
+
+                      event.preventDefault();
                       applySelection(asset.assetId, {
                         shiftKey: event.shiftKey,
                         metaKey: event.metaKey,
