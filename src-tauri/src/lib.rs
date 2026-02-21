@@ -17,7 +17,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use strsim::damerau_levenshtein;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{
+    menu::{MenuBuilder, SubmenuBuilder},
+    AppHandle, Emitter, Manager, State,
+};
 use uuid::Uuid;
 use walkdir::WalkDir;
 use zip::ZipArchive;
@@ -3007,6 +3010,22 @@ pub fn run() {
         .manage(AppState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            app.remove_menu()?;
+
+            #[cfg(target_os = "macos")]
+            {
+                let app_menu = SubmenuBuilder::new(app, "Minecraft Asset Explorer")
+                    .about(None)
+                    .separator()
+                    .quit()
+                    .build()?;
+                let menu = MenuBuilder::new(app).item(&app_menu).build()?;
+                app.set_menu(menu)?;
+            }
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             detect_prism_roots,
             list_instances,
