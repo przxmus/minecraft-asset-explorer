@@ -200,14 +200,10 @@ function App() {
       });
 
       setInstances(listed);
-      if (listed.length > 0) {
-        setSelectedInstance((current) => {
-          const exists = listed.some((item) => item.folderName === current);
-          return exists ? current : listed[0].folderName;
-        });
-      } else {
-        setSelectedInstance("");
-      }
+      setSelectedInstance((current) => {
+        const exists = listed.some((item) => item.folderName === current);
+        return exists ? current : "";
+      });
     } catch (error) {
       setStatusLine(String(error));
       setInstances([]);
@@ -761,7 +757,9 @@ function App() {
   }, [refreshVisibleTreeNodes]);
 
   const currentPreview = activeAsset ? previewCache[activeAsset.assetId] : undefined;
-  const isExplorerLocked = lifecycle !== "completed";
+  const needsInstanceSelection = !selectedInstance;
+  const isScanInProgress = lifecycle === "scanning" || isStartingScan;
+  const isExplorerLocked = needsInstanceSelection || isScanInProgress;
   const activeAssetIsJson =
     !!activeAsset &&
     (activeAsset.extension.toLowerCase() === "json" ||
@@ -805,6 +803,7 @@ function App() {
                 value={selectedInstance}
                 onChange={(event) => setSelectedInstance(event.currentTarget.value)}
               >
+                <option value="">Select instance...</option>
                 {instances.map((instance) => (
                   <option key={instance.folderName} value={instance.folderName}>
                     {instance.displayName}
@@ -812,16 +811,6 @@ function App() {
                   </option>
                 ))}
               </select>
-              <button
-                type="button"
-                className="mae-button mae-button-accent"
-                disabled={isStartingScan}
-                onClick={() => {
-                  void startScan();
-                }}
-              >
-                {isStartingScan ? "Scanning..." : "Rescan now"}
-              </button>
             </div>
           </div>
 
@@ -1184,9 +1173,15 @@ function App() {
         {isExplorerLocked ? (
           <div className="content-overlay">
             <div className="overlay-card">
-              <div className="overlay-title">Loading assets...</div>
+              <div className="overlay-title">
+                {needsInstanceSelection ? "Choose an instance" : "Loading assets..."}
+              </div>
               <div className="overlay-subtitle">
-                Explorer will unlock automatically after scan completes.
+                {needsInstanceSelection
+                  ? instances.length === 0
+                    ? "No valid instances found in this Prism root."
+                    : "Select an instance to start scanning assets."
+                  : "Explorer will unlock automatically after scan completes."}
               </div>
             </div>
           </div>

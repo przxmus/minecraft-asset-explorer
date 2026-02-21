@@ -434,6 +434,15 @@ fn list_instances(prism_root: String) -> Result<Vec<InstanceInfo>, String> {
         }
 
         let folder_name = entry.file_name().to_string_lossy().to_string();
+        if folder_name.starts_with('.') {
+            continue;
+        }
+
+        // Real Prism instances should contain profile metadata and minecraft folder.
+        if !instance_path.join("mmc-pack.json").is_file() || !instance_path.join("minecraft").is_dir() {
+            continue;
+        }
+
         let display_name = instance_display_name(&instance_path).unwrap_or_else(|| folder_name.clone());
         let minecraft_version = parse_minecraft_version(&instance_path.join("mmc-pack.json"));
 
