@@ -5,7 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "bun run build:web",
+    "build:web": "tsc && vite build",
+    "build:linux": "tauri build --bundles deb,appimage && node scripts/collect-release-artifacts.mjs linux",
+    "build:macos": "tauri build --bundles app,dmg && node scripts/collect-release-artifacts.mjs macos",
+    "build:windows": "tauri build --bundles msi,nsis && node scripts/collect-release-artifacts.mjs windows",
+    "build:all": "bun run build:linux && bun run build:macos && bun run build:windows && node scripts/collect-release-artifacts.mjs all",
     "preview": "vite preview",
     "tauri": "tauri"
   },
