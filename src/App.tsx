@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type CSSProperties,
+  type KeyboardEvent,
   type MouseEvent,
   type ReactElement,
   useCallback,
@@ -85,11 +86,26 @@ type AssetPreviewResponse = {
 
 type AudioFormat = "original" | "mp3" | "wav";
 
+type SearchResponse = {
+  total: number;
+  assets: AssetRecord[];
+};
+
+type SelectionModifiers = {
+  shiftKey: boolean;
+  metaKey: boolean;
+  ctrlKey: boolean;
+};
+
 const ROOT_NODE_ID = "root";
+const SEARCH_PAGE_SIZE = 320;
+const SEARCH_DEBOUNCE_MS = 200;
+const AUTO_SCAN_DEBOUNCE_MS = 260;
+const CHUNK_REFRESH_MS = 260;
 
 function App() {
-  const [rootCandidates, setRootCandidates] = useState<PrismRootCandidate[]>([]);
-  const [prismRoot, setPrismRoot] = useState("");
+  const [prismRootInput, setPrismRootInput] = useState("");
+  const [prismRootCommitted, setPrismRootCommitted] = useState("");
   const [instances, setInstances] = useState<InstanceInfo[]>([]);
   const [selectedInstance, setSelectedInstance] = useState("");
 
@@ -103,7 +119,6 @@ function App() {
 
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<AssetRecord[]>([]);
 
   const [treeByNodeId, setTreeByNodeId] = useState<Record<string, TreeNode[]>>({
     [ROOT_NODE_ID]: [],
@@ -111,7 +126,15 @@ function App() {
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
   const [selectedFolderId, setSelectedFolderId] = useState(ROOT_NODE_ID);
 
+  const [assets, setAssets] = useState<AssetRecord[]>([]);
+  const [searchTotal, setSearchTotal] = useState(0);
+  const [searchOffset, setSearchOffset] = useState(0);
+  const [hasMoreSearch, setHasMoreSearch] = useState(false);
+  const [isSearchLoading, setIsSearchLoading] = useState(false);
+  const [scanRefreshToken, setScanRefreshToken] = useState(0);
+
   const [selectedAssets, setSelectedAssets] = useState<Set<string>>(new Set());
+  const [selectionAnchorId, setSelectionAnchorId] = useState<string | null>(null);
   const [activeAssetId, setActiveAssetId] = useState<string | null>(null);
   const [previewCache, setPreviewCache] = useState<Record<string, AssetPreviewResponse>>({});
 
@@ -119,39 +142,43 @@ function App() {
   const [isStartingScan, setIsStartingScan] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isCopying, setIsCopying] = useState(false);
-  const [statusLine, setStatusLine] = useState("Gotowe.");
+  const [statusLine, setStatusLine] = useState("Ready.");
 
+  const activeScanIdRef = useRef<string | null>(null);
+  const searchRequestSeqRef = useRef(0);
+  const chunkRefreshTimeoutRef = useRef<number | null>(null);
+  const expandedNodesRef = useRef<Set<string>>(new Set());
+  const autoScanTimeoutRef = useRef<number | null>(null);
   const listParentRef = useRef<HTMLDivElement | null>(null);
+
+  const selectedAssetIds = useMemo(() => Array.from(selectedAssets), [selectedAssets]);
 
   const activeAsset = useMemo(() => {
     if (!activeAssetId) {
       return null;
     }
 
-    return searchResults.find((asset) => asset.assetId === activeAssetId) ?? null;
-  }, [activeAssetId, searchResults]);
-
-  const selectedAssetIds = useMemo(() => Array.from(selectedAssets), [selectedAssets]);
-
-  const visibleAssets = useMemo(() => {
-    if (selectedFolderId === ROOT_NODE_ID) {
-      return searchResults;
-    }
-
-    return searchResults.filter((asset) => {
-      const folderPath = assetFolderNodeId(asset);
-      return (
-        folderPath === selectedFolderId || folderPath.startsWith(`${selectedFolderId}/`)
-      );
-    });
-  }, [searchResults, selectedFolderId]);
+    return assets.find((asset) => asset.assetId === activeAssetId) ?? null;
+  }, [activeAssetId, assets]);
 
   const virtualizer = useVirtualizer({
-    count: visibleAssets.length,
+    count: assets.length,
     getScrollElement: () => listParentRef.current,
-    estimateSize: () => 56,
-    overscan: 10,
+    estimateSize: () => 58,
+    overscan: 12,
   });
+
+  const commitPrismRoot = useCallback(
+    (candidate: string) => {
+      const normalized = candidate.trim();
+      if (!normalized || normalized === prismRootCommitted) {
+        return;
+      }
+
+      setPrismRootCommitted(normalized);
+    },
+    [prismRootCommitted],
+  );
 
   const refreshInstances = useCallback(async (rootPath: string) => {
     if (!rootPath.trim()) {
@@ -164,12 +191,12 @@ function App() {
       const listed = await invoke<InstanceInfo[]>("list_instances", {
         prismRoot: rootPath,
       });
-      setInstances(listed);
 
+      setInstances(listed);
       if (listed.length > 0) {
         setSelectedInstance((current) => {
-          const existing = listed.some((item) => item.folderName === current);
-          return existing ? current : listed[0].folderName;
+          const exists = listed.some((item) => item.folderName === current);
+          return exists ? current : listed[0].folderName;
         });
       } else {
         setSelectedInstance("");
@@ -181,231 +208,131 @@ function App() {
     }
   }, []);
 
-  const loadTreeChildren = useCallback(
-    async (nodeId?: string) => {
-      if (!scanId) {
-        return;
-      }
-
-      try {
-        const children = await invoke<TreeNode[]>("list_tree_children", {
-          req: {
-            scanId,
-            nodeId,
-          },
-        });
-
-        setTreeByNodeId((current) => ({
-          ...current,
-          [nodeId ?? ROOT_NODE_ID]: children,
-        }));
-      } catch (error) {
-        setStatusLine(String(error));
-      }
-    },
-    [scanId],
-  );
-
-  const refreshSearch = useCallback(async () => {
-    if (!scanId) {
-      setSearchResults([]);
+  const loadTreeChildren = useCallback(async (nodeId?: string, scanOverride?: string) => {
+    const resolvedScanId = scanOverride ?? activeScanIdRef.current;
+    if (!resolvedScanId) {
       return;
     }
 
     try {
-      const response = await invoke<{ total: number; assets: AssetRecord[] }>(
-        "search_assets",
-        {
-          req: {
-            scanId,
-            query: debouncedQuery,
-            offset: 0,
-            limit: 5000,
-          },
+      const children = await invoke<TreeNode[]>("list_tree_children", {
+        req: {
+          scanId: resolvedScanId,
+          nodeId,
         },
-      );
+      });
 
-      setSearchResults(response.assets);
+      setTreeByNodeId((current) => ({
+        ...current,
+        [nodeId ?? ROOT_NODE_ID]: children,
+      }));
     } catch (error) {
       setStatusLine(String(error));
     }
-  }, [debouncedQuery, scanId]);
+  }, []);
 
-  useEffect(() => {
-    const timeout = window.setTimeout(() => {
-      setDebouncedQuery(query.trim());
-    }, 120);
+  const refreshVisibleTreeNodes = useCallback(
+    async (scanOverride?: string) => {
+      await loadTreeChildren(ROOT_NODE_ID, scanOverride);
 
-    return () => {
-      window.clearTimeout(timeout);
-    };
-  }, [query]);
+      const expanded = Array.from(expandedNodesRef.current);
+      await Promise.all(expanded.map((nodeId) => loadTreeChildren(nodeId, scanOverride)));
+    },
+    [loadTreeChildren],
+  );
 
-  useEffect(() => {
-    const loadRoots = async () => {
-      try {
-        const roots = await invoke<PrismRootCandidate[]>("detect_prism_roots");
-        setRootCandidates(roots);
+  const resetSearchState = useCallback(() => {
+    searchRequestSeqRef.current += 1;
+    setAssets([]);
+    setSearchTotal(0);
+    setSearchOffset(0);
+    setHasMoreSearch(false);
+    setIsSearchLoading(false);
+  }, []);
 
-        const preferred = roots.find((root) => root.valid) ?? roots[0];
-        if (preferred) {
-          setPrismRoot(preferred.path);
-          await refreshInstances(preferred.path);
-        }
-      } catch (error) {
-        setStatusLine(String(error));
+  const fetchSearchPage = useCallback(
+    async (reset: boolean) => {
+      const resolvedScanId = activeScanIdRef.current;
+      if (!resolvedScanId) {
+        resetSearchState();
+        return;
       }
-    };
 
-    void loadRoots();
-  }, [refreshInstances]);
+      if (isSearchLoading && !reset) {
+        return;
+      }
 
-  useEffect(() => {
-    if (!prismRoot) {
-      return;
-    }
+      const offset = reset ? 0 : searchOffset;
+      const requestId = ++searchRequestSeqRef.current;
 
-    void refreshInstances(prismRoot);
-  }, [prismRoot, refreshInstances]);
+      setIsSearchLoading(true);
 
-  useEffect(() => {
-    void refreshSearch();
-  }, [refreshSearch, progress?.assetCount]);
+      try {
+        const response = await invoke<SearchResponse>("search_assets", {
+          req: {
+            scanId: resolvedScanId,
+            query: debouncedQuery,
+            folderNodeId: selectedFolderId,
+            offset,
+            limit: SEARCH_PAGE_SIZE,
+          },
+        });
 
-  useEffect(() => {
-    const setupListeners = async () => {
-      const unlistenProgress = await listen<ScanProgressEvent>(
-        "scan://progress",
-        (event) => {
-          const payload = event.payload;
-          if (payload.scanId !== scanId) {
-            return;
-          }
-
-          setProgress(payload);
-          setStatusLine(
-            `Skanowanie: ${payload.scannedContainers}/${payload.totalContainers} kontenerów, ${payload.assetCount} assetów`,
-          );
-        },
-      );
-
-      const unlistenChunk = await listen<ScanChunkEvent>("scan://chunk", (event) => {
-        const payload = event.payload;
-        if (payload.scanId !== scanId) {
+        if (requestId !== searchRequestSeqRef.current) {
           return;
         }
 
-        setStatusLine((current) => {
-          if (payload.assets.length === 0) {
-            return current;
-          }
-
-          return `Dodano ${payload.assets.length} nowych assetów...`;
-        });
-      });
-
-      const unlistenComplete = await listen<ScanCompletedEvent>(
-        "scan://completed",
-        (event) => {
-          const payload = event.payload;
-          if (payload.scanId !== scanId) {
-            return;
-          }
-
-          setLifecycle(payload.lifecycle);
-          setStatusLine(
-            payload.lifecycle === "completed"
-              ? `Skan zakończony. Zindeksowano ${payload.assetCount} assetów.`
-              : `Skan zakończony statusem: ${payload.lifecycle}`,
-          );
-          void loadTreeChildren(ROOT_NODE_ID);
-          void refreshSearch();
-        },
-      );
-
-      const unlistenError = await listen<{ scanId: string; error: string }>(
-        "scan://error",
-        (event) => {
-          if (event.payload.scanId !== scanId) {
-            return;
-          }
-
-          setLifecycle("error");
-          setStatusLine(event.payload.error);
-        },
-      );
-
-      return () => {
-        unlistenProgress();
-        unlistenChunk();
-        unlistenComplete();
-        unlistenError();
-      };
-    };
-
-    let cleanup: (() => void) | undefined;
-    void setupListeners().then((teardown) => {
-      cleanup = teardown;
-    });
-
-    return () => {
-      cleanup?.();
-    };
-  }, [scanId, loadTreeChildren, refreshSearch]);
-
-  useEffect(() => {
-    const loadPreview = async () => {
-      if (!scanId || !activeAsset || !activeAsset.isImage) {
-        return;
-      }
-
-      if (previewCache[activeAsset.assetId]) {
-        return;
-      }
-
-      try {
-        const preview = await invoke<AssetPreviewResponse>("get_asset_preview", {
-          scanId,
-          assetId: activeAsset.assetId,
-        });
-
-        setPreviewCache((current) => ({
-          ...current,
-          [activeAsset.assetId]: preview,
-        }));
+        setAssets((current) => (reset ? response.assets : [...current, ...response.assets]));
+        const nextOffset = offset + response.assets.length;
+        setSearchOffset(nextOffset);
+        setSearchTotal(response.total);
+        setHasMoreSearch(nextOffset < response.total);
       } catch (error) {
-        setStatusLine(String(error));
+        if (requestId === searchRequestSeqRef.current) {
+          setStatusLine(String(error));
+        }
+      } finally {
+        if (requestId === searchRequestSeqRef.current) {
+          setIsSearchLoading(false);
+        }
       }
-    };
-
-    void loadPreview();
-  }, [activeAsset, previewCache, scanId]);
+    },
+    [debouncedQuery, isSearchLoading, resetSearchState, searchOffset, selectedFolderId],
+  );
 
   const startScan = useCallback(async () => {
-    if (!prismRoot || !selectedInstance) {
-      setStatusLine("Wybierz Prism root oraz instancję.");
+    if (!prismRootCommitted || !selectedInstance) {
       return;
     }
 
     if (!includeVanilla && !includeMods && !includeResourcepacks) {
-      setStatusLine("Wybierz przynajmniej jedno źródło assetów.");
+      setStatusLine("Select at least one source to scan.");
       return;
     }
 
     setIsStartingScan(true);
 
     try {
-      setSearchResults([]);
+      const previousScanId = activeScanIdRef.current;
+      if (previousScanId) {
+        await invoke("cancel_scan", { scanId: previousScanId }).catch(() => undefined);
+      }
+
+      resetSearchState();
       setTreeByNodeId({ [ROOT_NODE_ID]: [] });
       setExpandedNodes(new Set());
+      expandedNodesRef.current = new Set();
       setSelectedFolderId(ROOT_NODE_ID);
       setSelectedAssets(new Set());
+      setSelectionAnchorId(null);
       setActiveAssetId(null);
       setPreviewCache({});
+      setProgress(null);
+      setLifecycle("scanning");
 
       const response = await invoke<{ scanId: string }>("start_scan", {
         req: {
-          prismRoot,
+          prismRoot: prismRootCommitted,
           instanceFolder: selectedInstance,
           includeVanilla,
           includeMods,
@@ -413,13 +340,15 @@ function App() {
         },
       });
 
+      activeScanIdRef.current = response.scanId;
       setScanId(response.scanId);
-      setLifecycle("scanning");
-      setProgress(null);
-      setStatusLine("Skan uruchomiony.");
-      await loadTreeChildren(ROOT_NODE_ID);
+      setStatusLine("Scan started.");
+
+      await refreshVisibleTreeNodes(response.scanId);
+      setScanRefreshToken((value) => value + 1);
     } catch (error) {
       setStatusLine(String(error));
+      setLifecycle("error");
     } finally {
       setIsStartingScan(false);
     }
@@ -427,10 +356,130 @@ function App() {
     includeMods,
     includeResourcepacks,
     includeVanilla,
-    loadTreeChildren,
-    prismRoot,
+    prismRootCommitted,
+    refreshVisibleTreeNodes,
+    resetSearchState,
     selectedInstance,
   ]);
+
+  const applySelection = useCallback(
+    (assetId: string, modifiers: SelectionModifiers) => {
+      setSelectedAssets((current) => {
+        if (modifiers.shiftKey && selectionAnchorId) {
+          const ids = assets.map((asset) => asset.assetId);
+          const anchorIndex = ids.indexOf(selectionAnchorId);
+          const targetIndex = ids.indexOf(assetId);
+
+          if (anchorIndex >= 0 && targetIndex >= 0) {
+            const [start, end] =
+              anchorIndex < targetIndex
+                ? [anchorIndex, targetIndex]
+                : [targetIndex, anchorIndex];
+            return new Set(ids.slice(start, end + 1));
+          }
+        }
+
+        if (modifiers.metaKey || modifiers.ctrlKey) {
+          const next = new Set(current);
+          if (next.has(assetId)) {
+            next.delete(assetId);
+          } else {
+            next.add(assetId);
+          }
+          return next;
+        }
+
+        return new Set([assetId]);
+      });
+
+      if (!modifiers.shiftKey) {
+        setSelectionAnchorId(assetId);
+      }
+      setActiveAssetId(assetId);
+    },
+    [assets, selectionAnchorId],
+  );
+
+  const selectAllVisible = useCallback(() => {
+    const allIds = assets.map((asset) => asset.assetId);
+    setSelectedAssets(new Set(allIds));
+    if (allIds.length > 0) {
+      setSelectionAnchorId(allIds[0]);
+    }
+  }, [assets]);
+
+  const clearSelection = useCallback(() => {
+    setSelectedAssets(new Set());
+    setSelectionAnchorId(null);
+  }, []);
+
+  const saveAssets = useCallback(
+    async (assetIds: string[]) => {
+      if (assetIds.length === 0) {
+        return;
+      }
+
+      const resolvedScanId = activeScanIdRef.current;
+      if (!resolvedScanId) {
+        return;
+      }
+
+      const selectedPath = await open({ directory: true, multiple: false });
+      if (!selectedPath || Array.isArray(selectedPath)) {
+        return;
+      }
+
+      setIsSaving(true);
+      try {
+        const response = await invoke<{ savedFiles: string[] }>("save_assets", {
+          req: {
+            scanId: resolvedScanId,
+            assetIds,
+            destinationDir: selectedPath,
+            audioFormat,
+          },
+        });
+
+        setStatusLine(`Saved ${response.savedFiles.length} file(s).`);
+      } catch (error) {
+        setStatusLine(String(error));
+      } finally {
+        setIsSaving(false);
+      }
+    },
+    [audioFormat],
+  );
+
+  const copyAssets = useCallback(
+    async (assetIds: string[]) => {
+      if (assetIds.length === 0) {
+        return;
+      }
+
+      const resolvedScanId = activeScanIdRef.current;
+      if (!resolvedScanId) {
+        return;
+      }
+
+      setIsCopying(true);
+      try {
+        const response = await invoke<{ copiedFiles: string[] }>("copy_assets_to_clipboard", {
+          req: {
+            scanId: resolvedScanId,
+            assetIds,
+            audioFormat,
+          },
+        });
+
+        setStatusLine(`Copied ${response.copiedFiles.length} file(s) to clipboard.`);
+      } catch (error) {
+        setStatusLine(String(error));
+      } finally {
+        setIsCopying(false);
+      }
+    },
+    [audioFormat],
+  );
 
   const toggleFolder = useCallback(
     async (node: TreeNode) => {
@@ -441,13 +490,12 @@ function App() {
       setSelectedFolderId(node.id);
       setExpandedNodes((current) => {
         const next = new Set(current);
-
         if (next.has(node.id)) {
           next.delete(node.id);
         } else {
           next.add(node.id);
         }
-
+        expandedNodesRef.current = next;
         return next;
       });
 
@@ -458,101 +506,13 @@ function App() {
     [loadTreeChildren, treeByNodeId],
   );
 
-  const toggleAssetSelection = useCallback((assetId: string) => {
-    setSelectedAssets((current) => {
-      const next = new Set(current);
-      if (next.has(assetId)) {
-        next.delete(assetId);
-      } else {
-        next.add(assetId);
-      }
-      return next;
-    });
-  }, []);
-
-  const selectAllVisible = useCallback(() => {
-    setSelectedAssets(new Set(visibleAssets.map((asset) => asset.assetId)));
-  }, [visibleAssets]);
-
-  const clearSelection = useCallback(() => {
-    setSelectedAssets(new Set());
-  }, []);
-
-  const saveAssets = useCallback(
-    async (assetIds: string[]) => {
-      if (!scanId || assetIds.length === 0) {
-        return;
-      }
-
-      const selectedPath = await open({
-        directory: true,
-        multiple: false,
-      });
-
-      if (!selectedPath || Array.isArray(selectedPath)) {
-        return;
-      }
-
-      setIsSaving(true);
-      try {
-        const result = await invoke<{ savedFiles: string[] }>("save_assets", {
-          req: {
-            scanId,
-            assetIds,
-            destinationDir: selectedPath,
-            audioFormat,
-          },
-        });
-
-        setStatusLine(`Zapisano ${result.savedFiles.length} plików.`);
-      } catch (error) {
-        setStatusLine(String(error));
-      } finally {
-        setIsSaving(false);
-      }
-    },
-    [audioFormat, scanId],
-  );
-
-  const copyAssets = useCallback(
-    async (assetIds: string[]) => {
-      if (!scanId || assetIds.length === 0) {
-        return;
-      }
-
-      setIsCopying(true);
-      try {
-        const result = await invoke<{ copiedFiles: string[] }>(
-          "copy_assets_to_clipboard",
-          {
-            req: {
-              scanId,
-              assetIds,
-              audioFormat,
-            },
-          },
-        );
-
-        setStatusLine(`Skopiowano ${result.copiedFiles.length} plików do schowka.`);
-      } catch (error) {
-        setStatusLine(String(error));
-      } finally {
-        setIsCopying(false);
-      }
-    },
-    [audioFormat, scanId],
-  );
-
   const renderTree = useCallback(
     (nodeId: string, depth: number): ReactElement[] => {
       const nodes = treeByNodeId[nodeId] ?? [];
 
       return nodes.flatMap((node) => {
         const isExpanded = expandedNodes.has(node.id);
-
-        const rowStyle: CSSProperties = {
-          paddingInlineStart: `${12 + depth * 14}px`,
-        };
+        const rowStyle: CSSProperties = { paddingInlineStart: `${14 + depth * 14}px` };
 
         const row = (
           <button
@@ -560,9 +520,9 @@ function App() {
             type="button"
             className={`tree-row ${selectedFolderId === node.id ? "tree-row-active" : ""}`}
             style={rowStyle}
-            onClick={async () => {
+            onClick={() => {
               if (node.nodeType === "folder") {
-                await toggleFolder(node);
+                void toggleFolder(node);
               } else if (node.assetId) {
                 setActiveAssetId(node.assetId);
               }
@@ -585,6 +545,205 @@ function App() {
     [expandedNodes, selectedFolderId, toggleFolder, treeByNodeId],
   );
 
+  useEffect(() => {
+    expandedNodesRef.current = expandedNodes;
+  }, [expandedNodes]);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      setDebouncedQuery(query.trim());
+    }, SEARCH_DEBOUNCE_MS);
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [query]);
+
+  useEffect(() => {
+    const boot = async () => {
+      try {
+        const roots = await invoke<PrismRootCandidate[]>("detect_prism_roots");
+        const preferred = roots.find((root) => root.valid) ?? roots[0];
+        if (!preferred) {
+          setStatusLine("No Prism root candidates found.");
+          return;
+        }
+
+        setPrismRootInput(preferred.path);
+        setPrismRootCommitted(preferred.path);
+      } catch (error) {
+        setStatusLine(String(error));
+      }
+    };
+
+    void boot();
+  }, []);
+
+  useEffect(() => {
+    if (!prismRootCommitted) {
+      setInstances([]);
+      setSelectedInstance("");
+      return;
+    }
+
+    void refreshInstances(prismRootCommitted);
+  }, [prismRootCommitted, refreshInstances]);
+
+  useEffect(() => {
+    if (autoScanTimeoutRef.current) {
+      window.clearTimeout(autoScanTimeoutRef.current);
+      autoScanTimeoutRef.current = null;
+    }
+
+    if (!prismRootCommitted || !selectedInstance) {
+      return;
+    }
+
+    if (!includeVanilla && !includeMods && !includeResourcepacks) {
+      return;
+    }
+
+    autoScanTimeoutRef.current = window.setTimeout(() => {
+      void startScan();
+    }, AUTO_SCAN_DEBOUNCE_MS);
+
+    return () => {
+      if (autoScanTimeoutRef.current) {
+        window.clearTimeout(autoScanTimeoutRef.current);
+        autoScanTimeoutRef.current = null;
+      }
+    };
+  }, [
+    includeMods,
+    includeResourcepacks,
+    includeVanilla,
+    prismRootCommitted,
+    selectedInstance,
+    startScan,
+  ]);
+
+  useEffect(() => {
+    if (!scanId) {
+      resetSearchState();
+      return;
+    }
+
+    listParentRef.current?.scrollTo({ top: 0 });
+    void fetchSearchPage(true);
+  }, [debouncedQuery, fetchSearchPage, resetSearchState, scanId, scanRefreshToken, selectedFolderId]);
+
+  useEffect(() => {
+    const loadPreview = async () => {
+      const resolvedScanId = activeScanIdRef.current;
+      if (!resolvedScanId || !activeAsset) {
+        return;
+      }
+
+      if (!activeAsset.isImage && !activeAsset.isAudio) {
+        return;
+      }
+
+      if (previewCache[activeAsset.assetId]) {
+        return;
+      }
+
+      try {
+        const preview = await invoke<AssetPreviewResponse>("get_asset_preview", {
+          scanId: resolvedScanId,
+          assetId: activeAsset.assetId,
+        });
+
+        setPreviewCache((current) => ({
+          ...current,
+          [activeAsset.assetId]: preview,
+        }));
+      } catch (error) {
+        setStatusLine(String(error));
+      }
+    };
+
+    void loadPreview();
+  }, [activeAsset, previewCache]);
+
+  useEffect(() => {
+    const registerListeners = async () => {
+      const unlistenProgress = await listen<ScanProgressEvent>("scan://progress", (event) => {
+        if (event.payload.scanId !== activeScanIdRef.current) {
+          return;
+        }
+
+        setProgress(event.payload);
+        setStatusLine(
+          `Scanning ${event.payload.scannedContainers}/${event.payload.totalContainers} containers · ${event.payload.assetCount} assets`,
+        );
+      });
+
+      const unlistenChunk = await listen<ScanChunkEvent>("scan://chunk", (event) => {
+        if (event.payload.scanId !== activeScanIdRef.current) {
+          return;
+        }
+
+        if (chunkRefreshTimeoutRef.current) {
+          return;
+        }
+
+        chunkRefreshTimeoutRef.current = window.setTimeout(() => {
+          chunkRefreshTimeoutRef.current = null;
+          void refreshVisibleTreeNodes();
+          setScanRefreshToken((value) => value + 1);
+        }, CHUNK_REFRESH_MS);
+      });
+
+      const unlistenComplete = await listen<ScanCompletedEvent>("scan://completed", (event) => {
+        if (event.payload.scanId !== activeScanIdRef.current) {
+          return;
+        }
+
+        setLifecycle(event.payload.lifecycle);
+        setStatusLine(
+          event.payload.lifecycle === "completed"
+            ? `Scan completed: ${event.payload.assetCount} assets indexed.`
+            : `Scan finished with status: ${event.payload.lifecycle}`,
+        );
+
+        void refreshVisibleTreeNodes();
+        setScanRefreshToken((value) => value + 1);
+      });
+
+      const unlistenError = await listen<{ scanId: string; error: string }>(
+        "scan://error",
+        (event) => {
+          if (event.payload.scanId !== activeScanIdRef.current) {
+            return;
+          }
+
+          setLifecycle("error");
+          setStatusLine(event.payload.error);
+        },
+      );
+
+      return () => {
+        unlistenProgress();
+        unlistenChunk();
+        unlistenComplete();
+        unlistenError();
+      };
+    };
+
+    let teardown: (() => void) | undefined;
+    void registerListeners().then((cleanup) => {
+      teardown = cleanup;
+    });
+
+    return () => {
+      if (chunkRefreshTimeoutRef.current) {
+        window.clearTimeout(chunkRefreshTimeoutRef.current);
+        chunkRefreshTimeoutRef.current = null;
+      }
+      teardown?.();
+    };
+  }, [refreshVisibleTreeNodes]);
+
   const currentPreview = activeAsset ? previewCache[activeAsset.assetId] : undefined;
 
   return (
@@ -592,39 +751,31 @@ function App() {
       <header className="topbar">
         <div className="topbar-grid">
           <div className="field-group">
-            <label className="field-label" htmlFor="prism-root">
+            <label className="field-label" htmlFor="prism-root-input">
               Prism Root
             </label>
-            <div className="field-row">
-              <select
-                id="prism-root"
-                className="mae-select"
-                value={prismRoot}
-                onChange={(event) => setPrismRoot(event.currentTarget.value)}
-              >
-                {rootCandidates.map((candidate) => (
-                  <option key={`${candidate.path}:${candidate.source}`} value={candidate.path}>
-                    {candidate.path}
-                    {candidate.valid ? "" : " (invalid)"}
-                  </option>
-                ))}
-              </select>
-              <input
-                className="mae-input"
-                value={prismRoot}
-                onChange={(event) => setPrismRoot(event.currentTarget.value)}
-                placeholder="Wpisz path do PrismLauncher"
-              />
-            </div>
+            <input
+              id="prism-root-input"
+              className="mae-input"
+              placeholder="PrismLauncher path"
+              value={prismRootInput}
+              onChange={(event) => setPrismRootInput(event.currentTarget.value)}
+              onBlur={() => commitPrismRoot(prismRootInput)}
+              onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
+                if (event.key === "Enter") {
+                  commitPrismRoot(prismRootInput);
+                }
+              }}
+            />
           </div>
 
           <div className="field-group">
-            <label className="field-label" htmlFor="instance">
+            <label className="field-label" htmlFor="instance-select">
               Instance
             </label>
             <div className="field-row">
               <select
-                id="instance"
+                id="instance-select"
                 className="mae-select"
                 value={selectedInstance}
                 onChange={(event) => setSelectedInstance(event.currentTarget.value)}
@@ -632,13 +783,10 @@ function App() {
                 {instances.map((instance) => (
                   <option key={instance.folderName} value={instance.folderName}>
                     {instance.displayName}
-                    {instance.minecraftVersion
-                      ? ` (MC ${instance.minecraftVersion})`
-                      : " (bez wersji)"}
+                    {instance.minecraftVersion ? ` (MC ${instance.minecraftVersion})` : ""}
                   </option>
                 ))}
               </select>
-
               <button
                 type="button"
                 className="mae-button mae-button-accent"
@@ -647,39 +795,35 @@ function App() {
                   void startScan();
                 }}
               >
-                {isStartingScan ? "Starting..." : "Scan"}
+                {isStartingScan ? "Scanning..." : "Rescan now"}
               </button>
             </div>
           </div>
 
           <div className="field-group">
-            <div className="field-label">Include</div>
+            <div className="field-label">Sources</div>
             <div className="field-row checkbox-row">
               <label className="mae-checkbox">
                 <input
+                  type="checkbox"
                   checked={includeVanilla}
                   onChange={(event) => setIncludeVanilla(event.currentTarget.checked)}
-                  type="checkbox"
                 />
                 Vanilla
               </label>
-
               <label className="mae-checkbox">
                 <input
+                  type="checkbox"
                   checked={includeMods}
                   onChange={(event) => setIncludeMods(event.currentTarget.checked)}
-                  type="checkbox"
                 />
                 Mods
               </label>
-
               <label className="mae-checkbox">
                 <input
-                  checked={includeResourcepacks}
-                  onChange={(event) =>
-                    setIncludeResourcepacks(event.currentTarget.checked)
-                  }
                   type="checkbox"
+                  checked={includeResourcepacks}
+                  onChange={(event) => setIncludeResourcepacks(event.currentTarget.checked)}
                 />
                 Resourcepacks
               </label>
@@ -706,7 +850,7 @@ function App() {
             className="mae-search"
             value={query}
             onChange={(event) => setQuery(event.currentTarget.value)}
-            placeholder="Szukaj np. star / atm star / allthe star / item star"
+            placeholder="Search: star, atm star, all the star, item star"
           />
 
           <select
@@ -763,9 +907,27 @@ function App() {
         </aside>
 
         <section className="list-panel">
-          <div className="panel-title">Assets ({visibleAssets.length})</div>
+          <div className="panel-title">
+            Assets ({assets.length}/{searchTotal})
+            {isSearchLoading ? " · loading..." : ""}
+          </div>
 
-          <div className="asset-list" ref={listParentRef}>
+          <div
+            className="asset-list"
+            ref={listParentRef}
+            onScroll={() => {
+              const element = listParentRef.current;
+              if (!element || isSearchLoading || !hasMoreSearch) {
+                return;
+              }
+
+              const distanceToBottom =
+                element.scrollHeight - element.scrollTop - element.clientHeight;
+              if (distanceToBottom < 260) {
+                void fetchSearchPage(false);
+              }
+            }}
+          >
             <div
               style={{
                 height: `${virtualizer.getTotalSize()}px`,
@@ -774,7 +936,7 @@ function App() {
               }}
             >
               {virtualizer.getVirtualItems().map((virtualRow) => {
-                const asset = visibleAssets[virtualRow.index];
+                const asset = assets[virtualRow.index];
                 const isSelected = selectedAssets.has(asset.assetId);
 
                 const rowStyle: CSSProperties = {
@@ -788,21 +950,32 @@ function App() {
 
                 return (
                   <div
-                    className={`asset-row ${isSelected ? "asset-row-selected" : ""}`}
                     key={asset.assetId}
+                    className={`asset-row ${isSelected ? "asset-row-selected" : ""}`}
                     style={rowStyle}
+                    onClick={(event: MouseEvent<HTMLDivElement>) => {
+                      applySelection(asset.assetId, {
+                        shiftKey: event.shiftKey,
+                        metaKey: event.metaKey,
+                        ctrlKey: event.ctrlKey,
+                      });
+                    }}
                   >
                     <input
                       type="checkbox"
+                      readOnly
                       checked={isSelected}
-                      onChange={() => toggleAssetSelection(asset.assetId)}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        applySelection(asset.assetId, {
+                          shiftKey: event.shiftKey,
+                          metaKey: event.metaKey,
+                          ctrlKey: event.ctrlKey,
+                        });
+                      }}
                     />
 
-                    <button
-                      type="button"
-                      className="asset-main"
-                      onClick={() => setActiveAssetId(asset.assetId)}
-                    >
+                    <button type="button" className="asset-main">
                       <span className="asset-title">{asset.key}</span>
                       <span className="asset-subtitle">
                         {asset.sourceName} / {asset.namespace} / {asset.relativeAssetPath}
@@ -834,13 +1007,28 @@ function App() {
                 );
               })}
             </div>
+
+            {hasMoreSearch ? (
+              <div className="load-more-wrap">
+                <button
+                  type="button"
+                  className="mae-button"
+                  disabled={isSearchLoading}
+                  onClick={() => {
+                    void fetchSearchPage(false);
+                  }}
+                >
+                  {isSearchLoading ? "Loading..." : "Load more"}
+                </button>
+              </div>
+            ) : null}
           </div>
         </section>
 
         <aside className="preview-panel">
           <div className="panel-title">Preview</div>
           {!activeAsset ? (
-            <p className="muted">Wybierz asset, aby zobaczyć podgląd.</p>
+            <p className="muted">Select an asset to see preview.</p>
           ) : (
             <div className="preview-content">
               <div className="preview-key">{activeAsset.key}</div>
@@ -854,31 +1042,41 @@ function App() {
                   src={`data:${currentPreview.mime};base64,${currentPreview.base64}`}
                   alt={activeAsset.key}
                 />
-              ) : (
+              ) : null}
+
+              {activeAsset.isAudio && currentPreview ? (
+                <audio
+                  className="preview-audio"
+                  controls
+                  preload="metadata"
+                  src={`data:${currentPreview.mime};base64,${currentPreview.base64}`}
+                />
+              ) : null}
+
+              {!currentPreview ? (
+                <div className="preview-fallback">Loading preview...</div>
+              ) : null}
+
+              {!activeAsset.isImage && !activeAsset.isAudio ? (
                 <div className="preview-fallback">
-                  {activeAsset.isImage
-                    ? "Ładowanie preview..."
-                    : "Preview dostępny tylko dla obrazów"}
+                  Preview is available for image and audio assets.
                 </div>
-              )}
+              ) : null}
 
               <div className="preview-actions">
                 <button
                   type="button"
                   className="mae-button"
-                  onClick={(event: MouseEvent<HTMLButtonElement>) => {
-                    event.stopPropagation();
+                  onClick={() => {
                     void copyAssets([activeAsset.assetId]);
                   }}
                 >
                   Copy file
                 </button>
-
                 <button
                   type="button"
                   className="mae-button mae-button-accent"
-                  onClick={(event: MouseEvent<HTMLButtonElement>) => {
-                    event.stopPropagation();
+                  onClick={() => {
                     void saveAssets([activeAsset.assetId]);
                   }}
                 >
@@ -891,42 +1089,6 @@ function App() {
       </main>
     </div>
   );
-}
-
-function assetFolderNodeId(asset: AssetRecord): string {
-  const segments: string[] = [];
-
-  segments.push(sourceRootSegment(asset.sourceType));
-  segments.push(asset.sourceName);
-  segments.push(asset.namespace);
-
-  const splitPath = asset.relativeAssetPath.split("/");
-  if (splitPath.length > 1) {
-    for (const part of splitPath.slice(0, -1)) {
-      segments.push(part);
-    }
-  }
-
-  let nodeId = ROOT_NODE_ID;
-  for (const segment of segments) {
-    const escaped = segment.replace(/\//g, "∕");
-    nodeId = `${nodeId}/${escaped}`;
-  }
-
-  return nodeId;
-}
-
-function sourceRootSegment(sourceType: AssetSourceType): string {
-  switch (sourceType) {
-    case "vanilla":
-      return "vanilla";
-    case "mod":
-      return "mods";
-    case "resourcePack":
-      return "resourcepacks";
-    default:
-      return "unknown";
-  }
 }
 
 export default App;
