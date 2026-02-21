@@ -13,7 +13,7 @@ type AssetListPanelProps = {
   virtualItems: VirtualItem[];
   listParentRef: RefObject<HTMLDivElement | null>;
   onListScroll: () => void;
-  onApplySelection: (assetId: string, modifiers: SelectionModifiers) => void;
+  onApplySelection: (asset: AssetRecord, modifiers: SelectionModifiers) => void;
   onCopyAsset: (assetId: string) => void;
   onSaveAsset: (assetId: string) => void;
   onLoadMore: () => void;
@@ -82,7 +82,7 @@ export function AssetListPanel({
                 role="button"
                 tabIndex={0}
                 onClick={(event) => {
-                  onApplySelection(asset.assetId, buildSelectionModifiers(event));
+                  onApplySelection(asset, buildSelectionModifiers(event));
                 }}
                 onKeyDown={(event) => {
                   if (event.key !== "Enter" && event.key !== " ") {
@@ -90,7 +90,7 @@ export function AssetListPanel({
                   }
 
                   event.preventDefault();
-                  onApplySelection(asset.assetId, buildSelectionModifiers(event));
+                  onApplySelection(asset, buildSelectionModifiers(event));
                 }}
               >
                 <input
@@ -99,7 +99,7 @@ export function AssetListPanel({
                   checked={isSelected}
                   onClick={(event) => {
                     event.stopPropagation();
-                    onApplySelection(asset.assetId, buildSelectionModifiers(event));
+                    onApplySelection(asset, buildSelectionModifiers(event));
                   }}
                 />
 

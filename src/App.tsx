@@ -43,6 +43,16 @@ const AUTO_SCAN_DEBOUNCE_MS = 260;
 const PROGRESS_STATUS_THROTTLE_MS = 250;
 const PREVIEW_TOP_GAP_PX = 14;
 
+function parentFolderNodeId(nodeId: string): string {
+  const marker = "/file:";
+  const markerIndex = nodeId.lastIndexOf(marker);
+  if (markerIndex <= 0) {
+    return ROOT_NODE_ID;
+  }
+
+  return nodeId.slice(0, markerIndex);
+}
+
 function App() {
   const [prismRootInput, setPrismRootInput] = useState("");
   const [prismRootCommitted, setPrismRootCommitted] = useState("");
@@ -77,7 +87,7 @@ function App() {
 
   const [selectedAssets, setSelectedAssets] = useState<Set<string>>(new Set());
   const [selectionAnchorId, setSelectionAnchorId] = useState<string | null>(null);
-  const [activeAssetId, setActiveAssetId] = useState<string | null>(null);
+  const [activeAsset, setActiveAsset] = useState<AssetRecord | null>(null);
   const [previewCache, setPreviewCache] = useState<Record<string, AssetPreviewResponse>>({});
 
   const [audioFormat, setAudioFormat] = useState<AudioFormat>("original");
@@ -103,18 +113,6 @@ function App() {
   const deferredQuery = useDeferredValue(query);
 
   const selectedAssetIds = useMemo(() => Array.from(selectedAssets), [selectedAssets]);
-  const assetById = useMemo(
-    () => new Map(assets.map((asset) => [asset.assetId, asset])),
-    [assets],
-  );
-
-  const activeAsset = useMemo(() => {
-    if (!activeAssetId) {
-      return null;
-    }
-
-    return assetById.get(activeAssetId) ?? null;
-  }, [activeAssetId, assetById]);
 
   const virtualizer = useVirtualizer({
     count: assets.length,
@@ -291,7 +289,7 @@ function App() {
       setSelectedFolderId(ROOT_NODE_ID);
       setSelectedAssets(new Set());
       setSelectionAnchorId(null);
-      setActiveAssetId(null);
+      setActiveAsset(null);
       setPreviewCache({});
       setProgress(null);
       setLifecycle("scanning");
@@ -329,7 +327,8 @@ function App() {
   ]);
 
   const applySelection = useCallback(
-    (assetId: string, modifiers: SelectionModifiers) => {
+    (asset: AssetRecord, modifiers: SelectionModifiers) => {
+      const assetId = asset.assetId;
       setSelectedAssets((current) => {
         if (modifiers.shiftKey && selectionAnchorId) {
           const ids = assets.map((asset) => asset.assetId);
@@ -361,7 +360,7 @@ function App() {
       if (!modifiers.shiftKey) {
         setSelectionAnchorId(assetId);
       }
-      setActiveAssetId(assetId);
+      setActiveAsset(asset);
     },
     [assets, selectionAnchorId],
   );
@@ -472,6 +471,25 @@ function App() {
     [loadTreeChildren, treeByNodeId],
   );
 
+  const openAssetFromTree = useCallback(async (assetId: string, nodeId: string) => {
+    const resolvedScanId = activeScanIdRef.current;
+    if (!resolvedScanId) {
+      return;
+    }
+
+    try {
+      const asset = await invoke<AssetRecord>("get_asset_record", {
+        scanId: resolvedScanId,
+        assetId,
+      });
+
+      setActiveAsset(asset);
+      setSelectedFolderId(parentFolderNodeId(nodeId));
+    } catch (error) {
+      setStatusLine(String(error));
+    }
+  }, []);
+
   const renderTree = useCallback(
     (nodeId: string, depth: number): ReactElement[] => {
       const nodes = treeByNodeId[nodeId] ?? [];
@@ -490,7 +508,7 @@ function App() {
               if (node.nodeType === "folder") {
                 void toggleFolder(node);
               } else if (node.assetId) {
-                setActiveAssetId(node.assetId);
+                void openAssetFromTree(node.assetId, node.id);
               }
             }}
           >
@@ -508,7 +526,7 @@ function App() {
         return [row];
       });
     },
-    [expandedNodes, selectedFolderId, toggleFolder, treeByNodeId],
+    [expandedNodes, openAssetFromTree, selectedFolderId, toggleFolder, treeByNodeId],
   );
 
   useEffect(() => {
@@ -657,7 +675,7 @@ function App() {
   }, [activeAsset, previewCache]);
 
   useEffect(() => {
-    if (!activeAssetId) {
+    if (!activeAsset) {
       return;
     }
 
@@ -680,7 +698,7 @@ function App() {
 
     const targetTop = Math.max(0, window.scrollY + bounds.top - stickyTopOffset);
     window.scrollTo({ top: targetTop, behavior: "smooth" });
-  }, [activeAssetId, topbarHeight]);
+  }, [activeAsset, topbarHeight]);
 
   useEffect(() => {
     const registerListeners = async () => {
