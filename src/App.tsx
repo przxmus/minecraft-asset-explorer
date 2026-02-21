@@ -99,9 +99,9 @@ type SelectionModifiers = {
 
 const ROOT_NODE_ID = "root";
 const SEARCH_PAGE_SIZE = 320;
-const SEARCH_DEBOUNCE_MS = 200;
+const SEARCH_DEBOUNCE_MS = 260;
 const AUTO_SCAN_DEBOUNCE_MS = 260;
-const CHUNK_REFRESH_MS = 260;
+const PROGRESS_STATUS_THROTTLE_MS = 250;
 
 function App() {
   const [prismRootInput, setPrismRootInput] = useState("");
@@ -128,7 +128,6 @@ function App() {
 
   const [assets, setAssets] = useState<AssetRecord[]>([]);
   const [searchTotal, setSearchTotal] = useState(0);
-  const [searchOffset, setSearchOffset] = useState(0);
   const [hasMoreSearch, setHasMoreSearch] = useState(false);
   const [isSearchLoading, setIsSearchLoading] = useState(false);
   const [scanRefreshToken, setScanRefreshToken] = useState(0);
@@ -146,7 +145,11 @@ function App() {
 
   const activeScanIdRef = useRef<string | null>(null);
   const searchRequestSeqRef = useRef(0);
-  const chunkRefreshTimeoutRef = useRef<number | null>(null);
+  const isSearchLoadingRef = useRef(false);
+  const hasMoreSearchRef = useRef(false);
+  const searchOffsetRef = useRef(0);
+  const searchScrollThrottleRef = useRef(0);
+  const lastStatusAtRef = useRef(0);
   const expandedNodesRef = useRef<Set<string>>(new Set());
   const autoScanTimeoutRef = useRef<number | null>(null);
   const listParentRef = useRef<HTMLDivElement | null>(null);
@@ -243,9 +246,11 @@ function App() {
 
   const resetSearchState = useCallback(() => {
     searchRequestSeqRef.current += 1;
+    searchOffsetRef.current = 0;
+    hasMoreSearchRef.current = false;
+    isSearchLoadingRef.current = false;
     setAssets([]);
     setSearchTotal(0);
-    setSearchOffset(0);
     setHasMoreSearch(false);
     setIsSearchLoading(false);
   }, []);
@@ -258,13 +263,14 @@ function App() {
         return;
       }
 
-      if (isSearchLoading && !reset) {
+      if (isSearchLoadingRef.current && !reset) {
         return;
       }
 
-      const offset = reset ? 0 : searchOffset;
+      const offset = reset ? 0 : searchOffsetRef.current;
       const requestId = ++searchRequestSeqRef.current;
 
+      isSearchLoadingRef.current = true;
       setIsSearchLoading(true);
 
       try {
@@ -284,7 +290,8 @@ function App() {
 
         setAssets((current) => (reset ? response.assets : [...current, ...response.assets]));
         const nextOffset = offset + response.assets.length;
-        setSearchOffset(nextOffset);
+        searchOffsetRef.current = nextOffset;
+        hasMoreSearchRef.current = nextOffset < response.total;
         setSearchTotal(response.total);
         setHasMoreSearch(nextOffset < response.total);
       } catch (error) {
@@ -293,11 +300,12 @@ function App() {
         }
       } finally {
         if (requestId === searchRequestSeqRef.current) {
+          isSearchLoadingRef.current = false;
           setIsSearchLoading(false);
         }
       }
     },
-    [debouncedQuery, isSearchLoading, resetSearchState, searchOffset, selectedFolderId],
+    [debouncedQuery, resetSearchState, selectedFolderId],
   );
 
   const startScan = useCallback(async () => {
@@ -673,26 +681,16 @@ function App() {
         }
 
         setProgress(event.payload);
-        setStatusLine(
-          `Scanning ${event.payload.scannedContainers}/${event.payload.totalContainers} containers · ${event.payload.assetCount} assets`,
-        );
+        const now = Date.now();
+        if (now - lastStatusAtRef.current >= PROGRESS_STATUS_THROTTLE_MS) {
+          lastStatusAtRef.current = now;
+          setStatusLine(
+            `Scanning ${event.payload.scannedContainers}/${event.payload.totalContainers} containers · ${event.payload.assetCount} assets`,
+          );
+        }
       });
 
-      const unlistenChunk = await listen<ScanChunkEvent>("scan://chunk", (event) => {
-        if (event.payload.scanId !== activeScanIdRef.current) {
-          return;
-        }
-
-        if (chunkRefreshTimeoutRef.current) {
-          return;
-        }
-
-        chunkRefreshTimeoutRef.current = window.setTimeout(() => {
-          chunkRefreshTimeoutRef.current = null;
-          void refreshVisibleTreeNodes();
-          setScanRefreshToken((value) => value + 1);
-        }, CHUNK_REFRESH_MS);
-      });
+      const unlistenChunk = await listen<ScanChunkEvent>("scan://chunk", () => {});
 
       const unlistenComplete = await listen<ScanCompletedEvent>("scan://completed", (event) => {
         if (event.payload.scanId !== activeScanIdRef.current) {
@@ -736,10 +734,6 @@ function App() {
     });
 
     return () => {
-      if (chunkRefreshTimeoutRef.current) {
-        window.clearTimeout(chunkRefreshTimeoutRef.current);
-        chunkRefreshTimeoutRef.current = null;
-      }
       teardown?.();
     };
   }, [refreshVisibleTreeNodes]);
@@ -917,9 +911,15 @@ function App() {
             ref={listParentRef}
             onScroll={() => {
               const element = listParentRef.current;
-              if (!element || isSearchLoading || !hasMoreSearch) {
+              if (!element || isSearchLoadingRef.current || !hasMoreSearchRef.current) {
                 return;
               }
+
+              const now = Date.now();
+              if (now - searchScrollThrottleRef.current < 120) {
+                return;
+              }
+              searchScrollThrottleRef.current = now;
 
               const distanceToBottom =
                 element.scrollHeight - element.scrollTop - element.clientHeight;
