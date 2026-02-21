@@ -281,6 +281,29 @@ body {
   color: var(--text-tertiary);
 }
 
+.update-notice {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(246, 173, 85, 0.45);
+  border-radius: var(--radius-md);
+  background: rgba(246, 173, 85, 0.12);
+}
+
+.update-notice__message {
+  min-width: 0;
+  font-size: 11px;
+  color: #ffd9aa;
+}
+
+.update-notice__action {
+  flex-shrink: 0;
+  border-color: rgba(246, 173, 85, 0.5);
+}
+
 /* ── form elements ──────────────────────────────────────── */
 .mae-input,
 .mae-select,

@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type CSSProperties,
@@ -42,6 +44,20 @@ const SEARCH_DEBOUNCE_MS = 260;
 const AUTO_SCAN_DEBOUNCE_MS = 260;
 const PROGRESS_STATUS_THROTTLE_MS = 250;
 const PREVIEW_TOP_GAP_PX = 14;
+const RELEASES_LATEST_API_URL =
+  "https://api.github.com/repos/przxmus/minecraft-asset-explorer/releases/latest";
+const RELEASES_FALLBACK_URL = "https://github.com/przxmus/minecraft-asset-explorer/releases/latest";
+
+type LatestReleaseResponse = {
+  tag_name?: string;
+  html_url?: string;
+};
+
+type UpdateNotice = {
+  currentVersion: string;
+  latestTag: string;
+  releaseUrl: string;
+};
 
 function parentFolderNodeId(nodeId: string): string {
   const marker = "/file:";
@@ -51,6 +67,10 @@ function parentFolderNodeId(nodeId: string): string {
   }
 
   return nodeId.slice(0, markerIndex);
+}
+
+function normalizeVersionTag(version: string): string {
+  return version.trim().replace(/^v/i, "");
 }
 
 function App() {
@@ -96,6 +116,7 @@ function App() {
   const [isCopying, setIsCopying] = useState(false);
   const [statusLine, setStatusLine] = useState("Ready.");
   const [topbarHeight, setTopbarHeight] = useState(0);
+  const [updateNotice, setUpdateNotice] = useState<UpdateNotice | null>(null);
 
   const activeScanIdRef = useRef<string | null>(null);
   const searchRequestSeqRef = useRef(0);
@@ -585,6 +606,54 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const abortController = new AbortController();
+
+    const checkForUpdate = async () => {
+      try {
+        const [currentVersion, releaseResponse] = await Promise.all([
+          getVersion(),
+          fetch(RELEASES_LATEST_API_URL, {
+            headers: {
+              Accept: "application/vnd.github+json",
+            },
+            signal: abortController.signal,
+          }),
+        ]);
+
+        if (!releaseResponse.ok) {
+          return;
+        }
+
+        const releaseData = (await releaseResponse.json()) as LatestReleaseResponse;
+        const latestTag = releaseData.tag_name?.trim();
+        if (!latestTag) {
+          return;
+        }
+
+        if (normalizeVersionTag(latestTag) === normalizeVersionTag(currentVersion)) {
+          return;
+        }
+
+        setUpdateNotice({
+          currentVersion,
+          latestTag,
+          releaseUrl: releaseData.html_url?.trim() || RELEASES_FALLBACK_URL,
+        });
+      } catch (error) {
+        if ((error as { name?: string }).name === "AbortError") {
+          return;
+        }
+      }
+    };
+
+    void checkForUpdate();
+
+    return () => {
+      abortController.abort();
+    };
+  }, []);
+
+  useEffect(() => {
     if (!prismRootCommitted) {
       setInstances([]);
       setSelectedInstance("");
@@ -877,6 +946,23 @@ function App() {
           progressPercent={progressPercent}
           statusLine={statusLine}
         />
+        {updateNotice ? (
+          <div className="update-notice" role="status" aria-live="polite">
+            <span className="update-notice__message">
+              Update available: {updateNotice.currentVersion} installed, latest release tag is{" "}
+              {updateNotice.latestTag}.
+            </span>
+            <button
+              type="button"
+              className="mae-button mae-button-sm update-notice__action"
+              onClick={() => {
+                void openUrl(updateNotice.releaseUrl);
+              }}
+            >
+              Open latest release
+            </button>
+          </div>
+        ) : null}
       </header>
 
       <main className={`content-grid ${isExplorerLocked ? "content-grid-locked" : ""}`}>
