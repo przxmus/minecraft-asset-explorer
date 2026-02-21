@@ -157,6 +157,7 @@ function App() {
   const autoScanTimeoutRef = useRef<number | null>(null);
   const listParentRef = useRef<HTMLDivElement | null>(null);
   const previewContentRef = useRef<HTMLDivElement | null>(null);
+  const previewPanelRef = useRef<HTMLElement | null>(null);
 
   const selectedAssetIds = useMemo(() => Array.from(selectedAssets), [selectedAssets]);
 
@@ -693,6 +694,11 @@ function App() {
     }
 
     previewContentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+    previewPanelRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+      inline: "nearest",
+    });
   }, [activeAssetId]);
 
   useEffect(() => {
@@ -1108,7 +1114,7 @@ function App() {
           </div>
         </section>
 
-        <aside className="preview-panel">
+        <aside className="preview-panel" ref={previewPanelRef}>
           <div className="panel-title">Preview</div>
           {!activeAsset ? (
             <p className="muted">Select an asset to see preview.</p>

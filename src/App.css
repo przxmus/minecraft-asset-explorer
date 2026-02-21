@@ -307,6 +307,10 @@ body {
 
 .preview-panel {
   min-height: 0;
+  position: sticky;
+  top: 94px;
+  max-height: calc(100dvh - 108px);
+  align-self: start;
 }
 
 .preview-content {
@@ -442,5 +446,11 @@ body {
   .content-grid {
     grid-template-columns: 1fr;
     grid-template-rows: 260px minmax(340px, 1fr) minmax(280px, auto);
+  }
+
+  .preview-panel {
+    position: static;
+    top: auto;
+    max-height: none;
   }
 }
