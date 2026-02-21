@@ -23,24 +23,63 @@ if (!hostTarget) {
   process.exit(1);
 }
 
-const defaultTargetTriples = {
-  linux: ['x86_64-unknown-linux-gnu'],
-  macos: [process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin'],
-  windows: ['x86_64-pc-windows-msvc']
+const preferredTargetTriples = {
+  linux:
+    process.arch === 'arm64'
+      ? ['aarch64-unknown-linux-gnu', 'aarch64-unknown-linux-musl', 'x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl']
+      : ['x86_64-unknown-linux-gnu', 'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-gnu', 'aarch64-unknown-linux-musl'],
+  macos:
+    process.arch === 'arm64'
+      ? ['aarch64-apple-darwin', 'x86_64-apple-darwin']
+      : ['x86_64-apple-darwin', 'aarch64-apple-darwin'],
+  windows:
+    process.arch === 'arm64'
+      ? ['aarch64-pc-windows-msvc', 'x86_64-pc-windows-msvc', 'x86_64-pc-windows-gnu']
+      : ['x86_64-pc-windows-msvc', 'x86_64-pc-windows-gnu', 'aarch64-pc-windows-msvc']
 };
 
 function run(cmd, args) {
   const result = spawnSync(cmd, args, { stdio: 'inherit' });
+  return result.status === 0;
+}
+
+function listInstalledRustTargets() {
+  const result = spawnSync('rustup', ['target', 'list', '--installed'], { encoding: 'utf8' });
   if (result.status !== 0) {
-    process.exit(result.status ?? 1);
+    console.warn('[build] Could not read installed Rust targets; using fallback defaults.');
+    return new Set();
   }
+
+  return new Set(
+    result.stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+  );
+}
+
+const installedRustTargets = listInstalledRustTargets();
+
+function resolveDefaultTargetTriple(target) {
+  const preferred = preferredTargetTriples[target];
+  const installed = preferred.find((triple) => installedRustTargets.has(triple));
+
+  if (installed) {
+    return installed;
+  }
+
+  const fallback = preferred[0];
+  console.warn(
+    `[build] No preferred ${target} target is currently installed (${preferred.join(', ')}). Falling back to ${fallback}.`
+  );
+  return fallback;
 }
 
 function resolveTargetTriples(target) {
   const envKey = `TAURI_TARGET_${target.toUpperCase()}`;
   const raw = process.env[envKey];
   if (!raw) {
-    return defaultTargetTriples[target];
+    return [resolveDefaultTargetTriple(target)];
   }
 
   const triples = raw
@@ -56,26 +95,50 @@ function resolveTargetTriples(target) {
   return triples;
 }
 
-function buildTarget(target) {
+function buildTarget(target, { continueOnFailure = false } = {}) {
   const triples = resolveTargetTriples(target);
 
   for (const triple of triples) {
     console.log(`[build] Building ${target} release bundles for target ${triple}...`);
-    run('bunx', ['tauri', 'build', '--target', triple]);
+    const ok = run('bunx', ['tauri', 'build', '--target', triple]);
+    if (!ok) {
+      if (continueOnFailure) {
+        console.error(`[build] ${target} build failed for ${triple}.`);
+        return false;
+      }
+      process.exit(1);
+    }
   }
 
   console.log(`[build] Collecting ${target} artifacts...`);
-  run('node', ['scripts/collect-release-artifacts.mjs', target]);
+  const collected = run('node', ['scripts/collect-release-artifacts.mjs', target]);
+  if (!collected) {
+    if (continueOnFailure) {
+      console.error(`[build] Artifact collection failed for ${target}.`);
+      return false;
+    }
+    process.exit(1);
+  }
+
+  return true;
 }
 
 if (mode === 'all') {
   const targets = ['macos', 'linux', 'windows'];
   console.log(`[build] build:all on ${hostTarget} will attempt: ${targets.join(', ')}.`);
   console.log('[build] Cross-target builds require matching Rust targets and linker/toolchain support.');
+  const failedTargets = [];
   for (const target of targets) {
-    buildTarget(target);
+    const ok = buildTarget(target, { continueOnFailure: true });
+    if (!ok) {
+      failedTargets.push(target);
+    }
+  }
+  if (failedTargets.length > 0) {
+    console.error(`[build] build:all completed with failures: ${failedTargets.join(', ')}`);
+    process.exit(1);
   }
   process.exit(0);
 }
 
-buildTarget(mode);
+buildTarget(mode, { continueOnFailure: false });
