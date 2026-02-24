@@ -31,6 +31,7 @@ export type AssetRecord = {
 };
 
 export type ScanLifecycle = "scanning" | "completed" | "cancelled" | "error";
+export type ScanPhase = "estimating" | "fingerprinting" | "scanning" | "caching";
 
 export type TreeNodeType = "folder" | "file";
 
@@ -47,6 +48,7 @@ export type ScanProgressEvent = {
   scannedContainers: number;
   totalContainers: number;
   assetCount: number;
+  phase: ScanPhase;
   currentSource?: string;
 };
 
@@ -63,6 +65,57 @@ export type AssetPreviewResponse = {
 };
 
 export type AudioFormat = "original" | "mp3" | "wav";
+
+export type ExportOperationKind = "save" | "copy";
+
+export type ExportFailure = {
+  assetId: string;
+  key: string;
+  error: string;
+};
+
+export type ExportProgressEvent = {
+  operationId: string;
+  kind: ExportOperationKind;
+  requestedCount: number;
+  processedCount: number;
+  successCount: number;
+  failedCount: number;
+  cancelled: boolean;
+};
+
+export type ExportCompletedEvent = {
+  operationId: string;
+  kind: ExportOperationKind;
+  requestedCount: number;
+  processedCount: number;
+  successCount: number;
+  failedCount: number;
+  cancelled: boolean;
+  failures: ExportFailure[];
+};
+
+export type SaveAssetsResult = {
+  operationId: string;
+  requestedCount: number;
+  processedCount: number;
+  successCount: number;
+  failedCount: number;
+  cancelled: boolean;
+  failures: ExportFailure[];
+  savedFiles: string[];
+};
+
+export type CopyResult = {
+  operationId: string;
+  requestedCount: number;
+  processedCount: number;
+  successCount: number;
+  failedCount: number;
+  cancelled: boolean;
+  failures: ExportFailure[];
+  copiedFiles: string[];
+};
 
 export type SearchResponse = {
   total: number;

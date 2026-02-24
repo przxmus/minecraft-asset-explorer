@@ -304,6 +304,31 @@ body {
   border-color: rgba(246, 173, 85, 0.5);
 }
 
+.export-summary {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid rgba(66, 153, 225, 0.4);
+  border-radius: var(--radius-md);
+  background: rgba(66, 153, 225, 0.12);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.export-summary__title {
+  color: var(--text-primary);
+}
+
+.export-summary__list {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  max-height: 96px;
+  overflow: auto;
+}
+
+.export-summary__list li {
+  margin: 2px 0;
+}
+
 /* ── form elements ──────────────────────────────────────── */
 .mae-input,
 .mae-select,

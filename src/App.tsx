@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type CSSProperties,
@@ -26,10 +26,16 @@ import type {
   AssetPreviewResponse,
   AssetRecord,
   AudioFormat,
+  CopyResult,
+  ExportCompletedEvent,
+  ExportProgressEvent,
+  ExportFailure,
   InstanceInfo,
   PrismRootCandidate,
+  SaveAssetsResult,
   ScanCompletedEvent,
   ScanLifecycle,
+  ScanPhase,
   ScanProgressEvent,
   SearchResponse,
   SelectionModifiers,
@@ -59,6 +65,17 @@ type UpdateNotice = {
   releaseUrl: string;
 };
 
+type ExportSummary = {
+  operationId: string;
+  kind: "save" | "copy";
+  requestedCount: number;
+  processedCount: number;
+  successCount: number;
+  failedCount: number;
+  cancelled: boolean;
+  failures: ExportFailure[];
+};
+
 function parentFolderNodeId(nodeId: string): string {
   const marker = "/file:";
   const markerIndex = nodeId.lastIndexOf(marker);
@@ -71,6 +88,21 @@ function parentFolderNodeId(nodeId: string): string {
 
 function normalizeVersionTag(version: string): string {
   return version.trim().replace(/^v/i, "");
+}
+
+function scanPhaseLabel(phase: ScanPhase): string {
+  switch (phase) {
+    case "estimating":
+      return "Estimating containers";
+    case "fingerprinting":
+      return "Fingerprinting containers";
+    case "scanning":
+      return "Scanning assets";
+    case "caching":
+      return "Writing cache";
+    default:
+      return "Scanning";
+  }
 }
 
 function App() {
@@ -114,11 +146,15 @@ function App() {
   const [isStartingScan, setIsStartingScan] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isCopying, setIsCopying] = useState(false);
+  const [exportProgress, setExportProgress] = useState<ExportProgressEvent | null>(null);
+  const [exportSummary, setExportSummary] = useState<ExportSummary | null>(null);
   const [statusLine, setStatusLine] = useState("Ready.");
   const [topbarHeight, setTopbarHeight] = useState(0);
   const [updateNotice, setUpdateNotice] = useState<UpdateNotice | null>(null);
 
   const activeScanIdRef = useRef<string | null>(null);
+  const activeExportOperationIdRef = useRef<string | null>(null);
+  const saveDestinationByOperationRef = useRef<Record<string, string>>({});
   const searchRequestSeqRef = useRef(0);
   const isSearchLoadingRef = useRef(false);
   const hasMoreSearchRef = useRef(false);
@@ -313,6 +349,8 @@ function App() {
       setActiveAsset(null);
       setPreviewCache({});
       setProgress(null);
+      setExportProgress(null);
+      setExportSummary(null);
       setLifecycle("scanning");
 
       const response = await invoke<{ scanId: string }>("start_scan", {
@@ -404,6 +442,10 @@ function App() {
       if (assetIds.length === 0) {
         return;
       }
+      if (activeExportOperationIdRef.current) {
+        setStatusLine("Another export operation is already running.");
+        return;
+      }
 
       const resolvedScanId = activeScanIdRef.current;
       if (!resolvedScanId) {
@@ -415,19 +457,43 @@ function App() {
         return;
       }
 
+      const operationId = crypto.randomUUID();
+      activeExportOperationIdRef.current = operationId;
+      saveDestinationByOperationRef.current[operationId] = selectedPath;
+      setExportSummary(null);
+      setExportProgress({
+        operationId,
+        kind: "save",
+        requestedCount: assetIds.length,
+        processedCount: 0,
+        successCount: 0,
+        failedCount: 0,
+        cancelled: false,
+      });
+
       setIsSaving(true);
       try {
-        const response = await invoke<{ savedFiles: string[] }>("save_assets", {
+        const response = await invoke<SaveAssetsResult>("save_assets", {
           req: {
             scanId: resolvedScanId,
             assetIds,
             destinationDir: selectedPath,
             audioFormat,
+            operationId,
           },
         });
 
-        setStatusLine(`Saved ${response.savedFiles.length} file(s).`);
+        setStatusLine(
+          `Save finished: ${response.successCount}/${response.requestedCount} saved${
+            response.cancelled ? " (cancelled)" : ""
+          }.`,
+        );
       } catch (error) {
+        if (activeExportOperationIdRef.current === operationId) {
+          activeExportOperationIdRef.current = null;
+          setExportProgress(null);
+        }
+        delete saveDestinationByOperationRef.current[operationId];
         setStatusLine(String(error));
       } finally {
         setIsSaving(false);
@@ -441,24 +507,50 @@ function App() {
       if (assetIds.length === 0) {
         return;
       }
+      if (activeExportOperationIdRef.current) {
+        setStatusLine("Another export operation is already running.");
+        return;
+      }
 
       const resolvedScanId = activeScanIdRef.current;
       if (!resolvedScanId) {
         return;
       }
 
+      const operationId = crypto.randomUUID();
+      activeExportOperationIdRef.current = operationId;
+      setExportSummary(null);
+      setExportProgress({
+        operationId,
+        kind: "copy",
+        requestedCount: assetIds.length,
+        processedCount: 0,
+        successCount: 0,
+        failedCount: 0,
+        cancelled: false,
+      });
+
       setIsCopying(true);
       try {
-        const response = await invoke<{ copiedFiles: string[] }>("copy_assets_to_clipboard", {
+        const response = await invoke<CopyResult>("copy_assets_to_clipboard", {
           req: {
             scanId: resolvedScanId,
             assetIds,
             audioFormat,
+            operationId,
           },
         });
 
-        setStatusLine(`Copied ${response.copiedFiles.length} file(s) to clipboard.`);
+        setStatusLine(
+          `Copy finished: ${response.successCount}/${response.requestedCount} copied${
+            response.cancelled ? " (cancelled)" : ""
+          }.`,
+        );
       } catch (error) {
+        if (activeExportOperationIdRef.current === operationId) {
+          activeExportOperationIdRef.current = null;
+          setExportProgress(null);
+        }
         setStatusLine(String(error));
       } finally {
         setIsCopying(false);
@@ -466,6 +558,20 @@ function App() {
     },
     [audioFormat],
   );
+
+  const cancelExport = useCallback(async () => {
+    const operationId = activeExportOperationIdRef.current;
+    if (!operationId) {
+      return;
+    }
+
+    try {
+      await invoke("cancel_export", { operationId });
+      setStatusLine("Cancelling export...");
+    } catch (error) {
+      setStatusLine(String(error));
+    }
+  }, []);
 
   const toggleFolder = useCallback(
     async (node: TreeNode) => {
@@ -781,7 +887,7 @@ function App() {
         if (now - lastStatusAtRef.current >= PROGRESS_STATUS_THROTTLE_MS) {
           lastStatusAtRef.current = now;
           setStatusLine(
-            `Scanning ${event.payload.scannedContainers}/${event.payload.totalContainers} containers · ${event.payload.assetCount} assets`,
+            `${scanPhaseLabel(event.payload.phase)} · ${event.payload.scannedContainers}/${event.payload.totalContainers} containers · ${event.payload.assetCount} assets`,
           );
         }
       });
@@ -814,10 +920,75 @@ function App() {
         },
       );
 
+      const unlistenExportProgress = await listen<ExportProgressEvent>(
+        "export://progress",
+        (event) => {
+          if (event.payload.operationId !== activeExportOperationIdRef.current) {
+            return;
+          }
+
+          setExportProgress(event.payload);
+          const now = Date.now();
+          if (now - lastStatusAtRef.current >= PROGRESS_STATUS_THROTTLE_MS) {
+            lastStatusAtRef.current = now;
+            setStatusLine(
+              `${event.payload.kind === "save" ? "Saving" : "Copying"} ${
+                event.payload.processedCount
+              }/${event.payload.requestedCount} files · ${event.payload.successCount} ok · ${
+                event.payload.failedCount
+              } failed`,
+            );
+          }
+        },
+      );
+
+      const unlistenExportCompleted = await listen<ExportCompletedEvent>(
+        "export://completed",
+        (event) => {
+          if (event.payload.operationId !== activeExportOperationIdRef.current) {
+            return;
+          }
+
+          activeExportOperationIdRef.current = null;
+          setExportProgress(null);
+          setIsSaving(false);
+          setIsCopying(false);
+
+          setExportSummary({
+            operationId: event.payload.operationId,
+            kind: event.payload.kind,
+            requestedCount: event.payload.requestedCount,
+            processedCount: event.payload.processedCount,
+            successCount: event.payload.successCount,
+            failedCount: event.payload.failedCount,
+            cancelled: event.payload.cancelled,
+            failures: event.payload.failures,
+          });
+
+          setStatusLine(
+            `${event.payload.kind === "save" ? "Save" : "Copy"} completed: ${
+              event.payload.successCount
+            }/${event.payload.requestedCount} successful${
+              event.payload.cancelled ? " (cancelled)" : ""
+            }.`,
+          );
+
+          if (event.payload.kind === "save") {
+            const destination = saveDestinationByOperationRef.current[event.payload.operationId];
+            if (destination) {
+              delete saveDestinationByOperationRef.current[event.payload.operationId];
+              void openPath(destination).catch(() => undefined);
+            }
+          }
+        },
+      );
+
       return () => {
         unlistenProgress();
         unlistenComplete();
         unlistenError();
+        unlistenExportProgress();
+        unlistenExportCompleted();
       };
     };
 
@@ -834,6 +1005,7 @@ function App() {
   const currentPreview = activeAsset ? previewCache[activeAsset.assetId] : undefined;
   const needsInstanceSelection = !selectedInstance;
   const isScanInProgress = lifecycle === "scanning" || isStartingScan;
+  const isExportRunning = isSaving || isCopying || exportProgress !== null;
   const isExplorerLocked = needsInstanceSelection || isScanInProgress;
   const activeAssetIsJson =
     !!activeAsset &&
@@ -864,8 +1036,11 @@ function App() {
     [topbarHeight],
   );
 
-  const progressPercent =
-    progress && progress.totalContainers > 0
+  const progressPercent = exportProgress
+    ? exportProgress.requestedCount > 0
+      ? Math.round((exportProgress.processedCount / exportProgress.requestedCount) * 100)
+      : 0
+    : progress && progress.totalContainers > 0
       ? Math.round((progress.scannedContainers / progress.totalContainers) * 100)
       : 0;
 
@@ -930,6 +1105,7 @@ function App() {
           selectedAssetCount={selectedAssetIds.length}
           isCopying={isCopying}
           isSaving={isSaving}
+          isExportRunning={isExportRunning}
           onSelectAllVisible={selectAllVisible}
           onClearSelection={clearSelection}
           onCopySelection={() => {
@@ -938,11 +1114,15 @@ function App() {
           onSaveSelection={() => {
             void saveAssets(selectedAssetIds);
           }}
+          onCancelExport={() => {
+            void cancelExport();
+          }}
         />
         <StatusStrip
           lifecycle={lifecycle}
           lifecycleDotClass={lifecycleDotClass}
           progress={progress}
+          exportProgress={exportProgress}
           progressPercent={progressPercent}
           statusLine={statusLine}
         />
@@ -961,6 +1141,24 @@ function App() {
             >
               Open latest release
             </button>
+          </div>
+        ) : null}
+        {exportSummary ? (
+          <div className="export-summary" role="status" aria-live="polite">
+            <div className="export-summary__title">
+              {exportSummary.kind === "save" ? "Save" : "Copy"} result: {exportSummary.successCount}/
+              {exportSummary.requestedCount} successful
+              {exportSummary.cancelled ? " (cancelled)" : ""}.
+            </div>
+            {exportSummary.failedCount > 0 ? (
+              <ul className="export-summary__list">
+                {exportSummary.failures.slice(0, 8).map((failure) => (
+                  <li key={`${failure.assetId}:${failure.error}`}>
+                    <strong>{failure.key}</strong>: {failure.error}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
           </div>
         ) : null}
       </header>
