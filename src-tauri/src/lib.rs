@@ -1170,41 +1170,47 @@ fn run_scan_worker_inner(
         req.include_resourcepacks,
     );
 
-    let cache_store = load_scan_cache_store(app).unwrap_or_default();
-    let cached_entry = cache_store
+    let mut cache_store = load_scan_cache_store(app).unwrap_or_default();
+    let cached_entry_index = cache_store
         .entries
         .iter()
-        .find(|entry| entry.profile_key == profile_key)
-        .cloned();
-    let mut cached_containers_by_id = HashMap::<String, CachedContainer>::new();
-    if let Some(entry) = &cached_entry {
-        for container in &entry.containers {
-            cached_containers_by_id.insert(container.container_id.clone(), container.clone());
-        }
-    }
+        .position(|entry| entry.profile_key == profile_key);
+    let (cached_created_at, mut cached_containers_by_id) = if let Some(index) = cached_entry_index {
+        let entry = cache_store.entries.swap_remove(index);
+        let created_at = entry.created_at_unix_ms;
+        let containers = entry
+            .containers
+            .into_iter()
+            .map(|container| (container.container_id.clone(), container))
+            .collect::<HashMap<_, _>>();
+        (Some(created_at), containers)
+    } else {
+        (None, HashMap::new())
+    };
 
     let total_containers = resolved_containers.len();
     let mut unchanged_cache = Vec::<CachedContainer>::new();
     let mut changed_containers = Vec::<ResolvedScanContainer>::new();
-    let mut preloaded_assets = Vec::<AssetRecord>::new();
-
     for resolved in resolved_containers {
-        let cached = cached_containers_by_id.get(&resolved.container_id);
+        let cached = cached_containers_by_id.remove(&resolved.container_id);
         let unchanged = cached
+            .as_ref()
             .map(|item| item.fingerprint == resolved.fingerprint)
             .unwrap_or(false);
 
         if unchanged {
             if let Some(cached_container) = cached {
-                for asset in &cached_container.assets {
-                    preloaded_assets.push(asset.clone().into());
-                }
-                unchanged_cache.push(cached_container.clone());
+                unchanged_cache.push(cached_container);
             }
         } else {
             changed_containers.push(resolved);
         }
     }
+
+    let cached_asset_count: usize = unchanged_cache
+        .iter()
+        .map(|container| container.assets.len())
+        .sum();
 
     emit_scan_progress(
         app,
@@ -1212,7 +1218,7 @@ fn run_scan_worker_inner(
             scan_id: scan_id.to_string(),
             scanned_containers: unchanged_cache.len(),
             total_containers,
-            asset_count: preloaded_assets.len(),
+            asset_count: cached_asset_count,
             phase: ScanPhase::Scanning,
             current_source: Some("cache".to_string()),
         },
@@ -1228,7 +1234,9 @@ fn run_scan_worker_inner(
         if let Some(scan) = scans.get_mut(scan_id) {
             scan.total_containers = total_containers;
             scan.scanned_containers = unchanged_cache.len();
-            append_assets_to_scan_state(scan, &preloaded_assets);
+            for container in &unchanged_cache {
+                append_cached_assets_to_scan_state(scan, &container.assets);
+            }
         }
     }
 
@@ -1305,7 +1313,7 @@ fn run_scan_worker_inner(
 
     drop(sender);
 
-    let mut key_counts = rebuild_key_counts_from_assets(&preloaded_assets);
+    let mut key_counts = rebuild_key_counts_from_cached_containers(&unchanged_cache);
     let mut scanned_containers = unchanged_cache.len();
     let mut scanned_cache_containers = Vec::<CachedContainer>::new();
 
@@ -1359,26 +1367,28 @@ fn run_scan_worker_inner(
         cache_store,
         profile_key,
         all_cache_containers,
-        cached_entry.as_ref().map(|entry| entry.created_at_unix_ms),
+        cached_created_at,
     );
 
     Ok(())
 }
 
-fn append_assets_to_scan_state(scan: &mut ScanState, assets: &[AssetRecord]) {
-    for asset in assets {
+fn append_cached_assets_to_scan_state(scan: &mut ScanState, assets: &[CachedAssetRecord]) {
+    for cached in assets {
+        let asset: AssetRecord = cached.clone().into();
         if scan.asset_index.contains_key(&asset.asset_id) {
             continue;
         }
 
         let index = scan.assets.len();
         scan.asset_index.insert(asset.asset_id.clone(), index);
-        scan.search_records.push(build_search_record(asset));
-        scan.assets.push(asset.clone());
-        add_asset_to_tree(&mut scan.tree_children, asset);
+        scan.search_records.push(build_search_record(&asset));
+        add_asset_to_tree(&mut scan.tree_children, &asset);
+        scan.assets.push(asset);
     }
 }
 
+#[cfg(test)]
 fn rebuild_key_counts_from_assets(assets: &[AssetRecord]) -> HashMap<String, usize> {
     let mut counts = HashMap::<String, usize>::new();
 
@@ -1387,6 +1397,23 @@ fn rebuild_key_counts_from_assets(assets: &[AssetRecord]) -> HashMap<String, usi
         let required = suffix.map(|index| index + 1).unwrap_or(1);
         let current = counts.entry(base_key).or_insert(0);
         *current = (*current).max(required);
+    }
+
+    counts
+}
+
+fn rebuild_key_counts_from_cached_containers(
+    containers: &[CachedContainer],
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::<String, usize>::new();
+
+    for container in containers {
+        for asset in &container.assets {
+            let (base_key, suffix) = parse_dup_suffix(&asset.key);
+            let required = suffix.map(|index| index + 1).unwrap_or(1);
+            let current = counts.entry(base_key).or_insert(0);
+            *current = (*current).max(required);
+        }
     }
 
     counts
