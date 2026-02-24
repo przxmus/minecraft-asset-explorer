@@ -226,10 +226,53 @@ function dockerImageExists(image) {
   return runQuiet('docker', ['image', 'inspect', image]).ok;
 }
 
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function dockerDaemonReady() {
+  return runQuiet('docker', ['info']).ok;
+}
+
+function tryStartDockerDaemon() {
+  if (dockerDaemonReady()) {
+    return true;
+  }
+
+  if (host === 'darwin' && commandExists('orb')) {
+    console.log('[build] Docker daemon is not reachable. Trying to start OrbStack...');
+    run('orb', ['start']);
+  }
+
+  if (host === 'darwin' && commandExists('open')) {
+    // Best effort: try common desktop daemons in case CLI startup is unavailable.
+    runQuiet('open', ['-ga', 'OrbStack']);
+    runQuiet('open', ['-ga', 'Docker']);
+  }
+
+  const timeoutMs = 45_000;
+  const intervalMs = 1_000;
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (dockerDaemonReady()) {
+      return true;
+    }
+    sleepMs(intervalMs);
+  }
+
+  return false;
+}
+
 function ensureLinuxDockerImage() {
   if (!commandExists('docker')) {
     console.error('[build] Docker is required for Linux builds on non-Linux hosts.');
     console.error('[build] Install Docker Desktop and rerun, or set BUILD_LINUX_USE_DOCKER=0 to use direct cross-compilation.');
+    return false;
+  }
+
+  if (!tryStartDockerDaemon()) {
+    console.error('[build] Docker daemon is not running.');
+    console.error('[build] Start Docker Desktop/OrbStack and rerun.');
     return false;
   }
 

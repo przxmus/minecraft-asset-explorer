@@ -109,6 +109,7 @@ Cross-target notes:
 - Cross-compiling requires installed Rust targets plus working linker/toolchain support for each target.
 - On non-Linux hosts, Linux builds default to a Docker-based Linux builder image (avoids GTK/WebKit pkg-config cross-compilation issues).
 - Install Docker Desktop for Linux builds from macOS/Windows.
+- On macOS, the script will try to auto-start OrbStack/Docker Desktop if the daemon is not running.
 - Set `BUILD_LINUX_USE_DOCKER=0` to force direct Linux cross-compilation on the host instead of Docker.
 - Override default Rust targets per platform with:
   - `TAURI_TARGET_MACOS`
