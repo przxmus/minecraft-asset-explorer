@@ -32,6 +32,7 @@ const SCAN_CACHE_FILE_NAME: &str = "scan-cache-v2.json";
 const SCAN_CACHE_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const SCAN_CACHE_MAX_ENTRIES: usize = 20;
 const MAX_SCAN_FINGERPRINT_WORKERS: usize = 12;
+const MAX_SCAN_WORKERS: usize = 8;
 const MAX_EXPORT_WORKERS: usize = 16;
 
 #[derive(Default)]
@@ -1285,7 +1286,7 @@ fn run_scan_worker_inner(
     let workers = thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1)
-        .max(1)
+        .clamp(1, MAX_SCAN_WORKERS)
         .min(changed_containers.len());
 
     let (sender, receiver) = mpsc::channel::<ScanWorkerResult>();
