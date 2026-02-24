@@ -4320,6 +4320,83 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_root);
     }
 
+    #[test]
+    fn refresh_plan_detects_changed_new_and_removed_containers() {
+        let temp_root = std::env::temp_dir().join(format!("mae-refresh-plan-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_root).expect("must create temp root");
+
+        let container_a = temp_root.join("a.jar");
+        let container_b = temp_root.join("b.jar");
+        let container_c = temp_root.join("c.jar");
+        fs::write(&container_a, b"a").expect("must write a");
+        fs::write(&container_b, b"b").expect("must write b");
+
+        let cached_a = ScanContainer {
+            source_type: AssetSourceType::Mod,
+            source_name: "a".to_string(),
+            container_type: AssetContainerType::Jar,
+            container_path: container_a.clone(),
+        };
+        let cached_b = ScanContainer {
+            source_type: AssetSourceType::Mod,
+            source_name: "b".to_string(),
+            container_type: AssetContainerType::Jar,
+            container_path: container_b.clone(),
+        };
+        let mut cached_signatures = HashMap::new();
+        cached_signatures.insert(
+            scan_container_key(&cached_a),
+            container_signature_for_path(&container_a, &AssetContainerType::Jar)
+                .expect("signature for a"),
+        );
+        cached_signatures.insert(
+            scan_container_key(&cached_b),
+            container_signature_for_path(&container_b, &AssetContainerType::Jar)
+                .expect("signature for b"),
+        );
+
+        fs::write(&container_c, b"c").expect("must write c");
+        let current = vec![
+            cached_a.clone(),
+            ScanContainer {
+                source_type: AssetSourceType::Mod,
+                source_name: "c".to_string(),
+                container_type: AssetContainerType::Jar,
+                container_path: container_c.clone(),
+            },
+        ];
+
+        let plan = build_scan_refresh_plan(&cached_signatures, &current).expect("refresh plan");
+        assert_eq!(plan.unchanged_keys.len(), 1);
+        assert_eq!(plan.changed_or_new.len(), 1);
+        assert_eq!(plan.removed_keys.len(), 1);
+        assert!(plan
+            .removed_keys
+            .contains(&scan_container_key(&cached_b)));
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn reconciliation_maps_assets_with_same_identity() {
+        let old = sample_asset(
+            "mod.sample.sample.textures.item.star.png",
+            AssetSourceType::Mod,
+            "sample",
+            "sample",
+            "textures/item/star.png",
+        );
+        let mut new = old.clone();
+        new.asset_id = "mod.sample.sample.textures.item.star.png.dup1".to_string();
+        new.key = new.asset_id.clone();
+
+        let mapping = build_asset_reconciliation_map(&[old.clone()], &[new.clone()]);
+        assert_eq!(
+            mapping.get(&old.asset_id).map(|value| value.as_str()),
+            Some(new.asset_id.as_str())
+        );
+    }
+
     fn sample_asset(
         key: &str,
         source_type: AssetSourceType,
