@@ -26,7 +26,7 @@ const zigRunnerPath = resolve(repoRoot, 'scripts', 'tauri-zigbuild-runner.sh');
 const toolShimDir = resolve(repoRoot, '.codex-tool-shims');
 const linuxDockerBuildContext = resolve(repoRoot, 'scripts', 'docker');
 const linuxDockerfilePath = resolve(linuxDockerBuildContext, 'linux-builder.Dockerfile');
-const linuxDockerImage = process.env.BUILD_LINUX_DOCKER_IMAGE ?? 'minecraft-asset-explorer-linux-builder:bookworm';
+const linuxDockerImage = process.env.BUILD_LINUX_DOCKER_IMAGE ?? 'minecraft-asset-explorer-linux-builder:bookworm-v2';
 const linuxNodeModulesVolume = process.env.BUILD_LINUX_NODE_MODULES_VOLUME ?? 'minecraft-asset-explorer-linux-node-modules';
 
 if (!hostTarget) {
@@ -348,7 +348,7 @@ function buildLinuxWithDocker() {
     'CI=true',
     linuxDockerImage,
     'bash',
-    '-lc',
+    '-c',
     containerCommand
   ]);
 

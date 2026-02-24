@@ -19,6 +19,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://bun.sh/install | bash
 
 ENV BUN_INSTALL=/root/.bun
-ENV PATH=/root/.bun/bin:${PATH}
+ENV PATH=/root/.bun/bin:/usr/local/cargo/bin:/root/.cargo/bin:${PATH}
 
 WORKDIR /workspace
