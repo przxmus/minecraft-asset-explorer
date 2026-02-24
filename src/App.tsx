@@ -364,20 +364,30 @@ function App() {
           return;
         }
 
-        const totalContainers = Math.max(status.totalContainers, status.scannedContainers);
+        const currentProgress = progress && progress.scanId === status.scanId ? progress : null;
+        const totalContainers = Math.max(
+          status.totalContainers,
+          status.scannedContainers,
+          currentProgress?.totalContainers ?? 0,
+        );
+        const scannedContainers =
+          status.lifecycle === "scanning"
+            ? Math.max(status.scannedContainers, currentProgress?.scannedContainers ?? 0)
+            : Math.max(status.scannedContainers, totalContainers);
+        const assetCount = Math.max(status.assetCount, currentProgress?.assetCount ?? 0);
         const inferredPhase: ScanPhase =
-          progress && progress.scanId === status.scanId
-            ? progress.phase
+          currentProgress
+            ? currentProgress.phase
             : totalContainers === 0
               ? "estimating"
               : "scanning";
         const nextProgress: ScanProgressEvent = {
           scanId: status.scanId,
-          scannedContainers: status.scannedContainers,
+          scannedContainers,
           totalContainers,
-          assetCount: status.assetCount,
+          assetCount,
           phase: inferredPhase,
-          currentSource: progress?.scanId === status.scanId ? progress.currentSource : undefined,
+          currentSource: currentProgress?.currentSource,
         };
         setProgress(nextProgress);
 
@@ -393,7 +403,7 @@ function App() {
 
         setLifecycle(status.lifecycle);
         if (status.lifecycle === "completed") {
-          setStatusLine(`Scan completed: ${status.assetCount} assets indexed.`);
+          setStatusLine(`Scan completed: ${nextProgress.assetCount} assets indexed.`);
           if (terminalScanSyncRef.current !== status.scanId) {
             terminalScanSyncRef.current = status.scanId;
             void refreshVisibleTreeNodes(status.scanId);
