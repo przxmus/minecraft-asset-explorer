@@ -855,6 +855,14 @@ body {
   line-height: 1.6;
 }
 
+.overlay-details {
+  margin-top: 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+
 /* ── progress bar ───────────────────────────────────────── */
 .progress-bar {
   height: 2px;

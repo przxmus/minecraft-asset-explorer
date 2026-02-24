@@ -18,10 +18,13 @@ export function StatusStrip({
   statusLine,
 }: StatusStripProps) {
   const progressLabel = exportProgress
-    ? `${exportProgress.processedCount}/${exportProgress.requestedCount} files · ${exportProgress.successCount} ok · ${exportProgress.failedCount} failed`
+    ? `${progressPercent}% · ${exportProgress.processedCount}/${exportProgress.requestedCount} files · ${exportProgress.successCount} ok · ${exportProgress.failedCount} failed`
     : progress
-      ? `${progress.scannedContainers}/${progress.totalContainers} containers · ${progress.assetCount} assets`
-      : null;
+      ? `${progressPercent}% · ${progress.scannedContainers}/${progress.totalContainers} containers · ${progress.assetCount} assets`
+      : lifecycle === "scanning"
+        ? "0% · 0/0 containers · 0 assets"
+        : null;
+  const showProgress = lifecycle === "scanning" || progressLabel !== null;
 
   return (
     <div className="status-strip">
@@ -30,12 +33,12 @@ export function StatusStrip({
         {lifecycle}
       </span>
 
-      {progressLabel ? (
+      {showProgress ? (
         <>
           <div className="progress-bar">
             <div className="progress-bar__fill" style={{ width: `${progressPercent}%` }} />
           </div>
-          <span className="status-strip__progress">{progressLabel}</span>
+          <span className="status-strip__progress">{progressLabel ?? "0% · 0/0 containers · 0 assets"}</span>
         </>
       ) : null}
 

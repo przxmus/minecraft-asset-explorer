@@ -37,6 +37,7 @@ import type {
   ScanLifecycle,
   ScanPhase,
   ScanProgressEvent,
+  ScanStatus,
   SearchResponse,
   SelectionModifiers,
   TreeNode,
@@ -49,6 +50,7 @@ const SEARCH_PAGE_SIZE = 320;
 const SEARCH_DEBOUNCE_MS = 260;
 const AUTO_SCAN_DEBOUNCE_MS = 260;
 const PROGRESS_STATUS_THROTTLE_MS = 250;
+const SCAN_STATUS_POLL_MS = 500;
 const PREVIEW_TOP_GAP_PX = 14;
 const RELEASES_LATEST_API_URL =
   "https://api.github.com/repos/przxmus/minecraft-asset-explorer/releases/latest";
@@ -101,6 +103,10 @@ function scanPhaseLabel(phase: ScanPhase): string {
     default:
       return "Scanning";
   }
+}
+
+function formatScanProgressLine(progress: Pick<ScanProgressEvent, "scannedContainers" | "totalContainers" | "assetCount">): string {
+  return `${progress.scannedContainers}/${progress.totalContainers} containers · ${progress.assetCount} assets`;
 }
 
 async function openSavedDestination(destinationPath: string, savedFiles: string[]) {
@@ -177,6 +183,8 @@ function App() {
 
   const activeScanIdRef = useRef<string | null>(null);
   const activeExportOperationIdRef = useRef<string | null>(null);
+  const lastScanProgressAtRef = useRef(0);
+  const terminalScanSyncRef = useRef<string | null>(null);
   const searchRequestSeqRef = useRef(0);
   const isSearchLoadingRef = useRef(false);
   const hasMoreSearchRef = useRef(false);
@@ -343,6 +351,63 @@ function App() {
     ],
   );
 
+  const syncScanStatus = useCallback(
+    async (targetScanId: string) => {
+      try {
+        const status = await invoke<ScanStatus>("get_scan_status", { scanId: targetScanId });
+        if (status.scanId !== activeScanIdRef.current) {
+          return;
+        }
+
+        const totalContainers = Math.max(status.totalContainers, status.scannedContainers);
+        const inferredPhase: ScanPhase =
+          progress && progress.scanId === status.scanId
+            ? progress.phase
+            : totalContainers === 0
+              ? "estimating"
+              : "scanning";
+        const nextProgress: ScanProgressEvent = {
+          scanId: status.scanId,
+          scannedContainers: status.scannedContainers,
+          totalContainers,
+          assetCount: status.assetCount,
+          phase: inferredPhase,
+          currentSource: progress?.scanId === status.scanId ? progress.currentSource : undefined,
+        };
+        setProgress(nextProgress);
+
+        if (status.lifecycle === "scanning") {
+          setLifecycle("scanning");
+          const now = Date.now();
+          if (now - lastStatusAtRef.current >= PROGRESS_STATUS_THROTTLE_MS) {
+            lastStatusAtRef.current = now;
+            setStatusLine(`${scanPhaseLabel(nextProgress.phase)} · ${formatScanProgressLine(nextProgress)}`);
+          }
+          return;
+        }
+
+        setLifecycle(status.lifecycle);
+        if (status.lifecycle === "completed") {
+          setStatusLine(`Scan completed: ${status.assetCount} assets indexed.`);
+          if (terminalScanSyncRef.current !== status.scanId) {
+            terminalScanSyncRef.current = status.scanId;
+            void refreshVisibleTreeNodes(status.scanId);
+            setScanRefreshToken((value) => value + 1);
+          }
+        } else if (status.lifecycle === "cancelled") {
+          setStatusLine("Scan cancelled.");
+        } else {
+          setStatusLine(status.error ?? "Scan failed.");
+        }
+      } catch (error) {
+        if (targetScanId === activeScanIdRef.current) {
+          setStatusLine(String(error));
+        }
+      }
+    },
+    [progress, refreshVisibleTreeNodes],
+  );
+
   const startScan = useCallback(async () => {
     if (!prismRootCommitted || !selectedInstance) {
       return;
@@ -371,9 +436,14 @@ function App() {
       setActiveAsset(null);
       setPreviewCache({});
       setProgress(null);
+      setScanId(null);
+      activeScanIdRef.current = null;
       setExportProgress(null);
       setExportSummary(null);
       setLifecycle("scanning");
+      terminalScanSyncRef.current = null;
+      lastScanProgressAtRef.current = 0;
+      setStatusLine("Estimating containers · 0/0 containers · 0 assets");
 
       const response = await invoke<{ scanId: string }>("start_scan", {
         req: {
@@ -387,7 +457,15 @@ function App() {
 
       activeScanIdRef.current = response.scanId;
       setScanId(response.scanId);
-      setStatusLine("Scan started.");
+      setProgress({
+        scanId: response.scanId,
+        scannedContainers: 0,
+        totalContainers: 0,
+        assetCount: 0,
+        phase: "estimating",
+      });
+      setStatusLine("Estimating containers · 0/0 containers · 0 assets");
+      await syncScanStatus(response.scanId);
 
       await refreshVisibleTreeNodes(response.scanId);
       setScanRefreshToken((value) => value + 1);
@@ -405,6 +483,7 @@ function App() {
     refreshVisibleTreeNodes,
     resetSearchState,
     selectedInstance,
+    syncScanStatus,
   ]);
 
   const applySelection = useCallback(
@@ -903,13 +982,13 @@ function App() {
           return;
         }
 
+        lastScanProgressAtRef.current = Date.now();
+        setLifecycle("scanning");
         setProgress(event.payload);
         const now = Date.now();
         if (now - lastStatusAtRef.current >= PROGRESS_STATUS_THROTTLE_MS) {
           lastStatusAtRef.current = now;
-          setStatusLine(
-            `${scanPhaseLabel(event.payload.phase)} · ${event.payload.scannedContainers}/${event.payload.totalContainers} containers · ${event.payload.assetCount} assets`,
-          );
+          setStatusLine(`${scanPhaseLabel(event.payload.phase)} · ${formatScanProgressLine(event.payload)}`);
         }
       });
 
@@ -918,7 +997,9 @@ function App() {
           return;
         }
 
+        terminalScanSyncRef.current = event.payload.scanId;
         setLifecycle(event.payload.lifecycle);
+        lastScanProgressAtRef.current = Date.now();
         setStatusLine(
           event.payload.lifecycle === "completed"
             ? `Scan completed: ${event.payload.assetCount} assets indexed.`
@@ -937,6 +1018,7 @@ function App() {
           }
 
           setLifecycle("error");
+          lastScanProgressAtRef.current = Date.now();
           setStatusLine(event.payload.error);
         },
       );
@@ -1015,6 +1097,25 @@ function App() {
     };
   }, [refreshVisibleTreeNodes]);
 
+  useEffect(() => {
+    if (lifecycle !== "scanning" || !scanId) {
+      return;
+    }
+
+    const tick = () => {
+      if (Date.now() - lastScanProgressAtRef.current < SCAN_STATUS_POLL_MS) {
+        return;
+      }
+      void syncScanStatus(scanId);
+    };
+
+    tick();
+    const timer = window.setInterval(tick, SCAN_STATUS_POLL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [lifecycle, scanId, syncScanStatus]);
+
   const currentPreview = activeAsset ? previewCache[activeAsset.assetId] : undefined;
   const needsInstanceSelection = !selectedInstance;
   const isScanInProgress = lifecycle === "scanning" || isStartingScan;
@@ -1048,13 +1149,27 @@ function App() {
       }) as CSSProperties,
     [topbarHeight],
   );
+  const effectiveScanProgress: ScanProgressEvent | null = progress
+    ? progress
+    : isScanInProgress
+      ? {
+          scanId: scanId ?? "pending",
+          scannedContainers: 0,
+          totalContainers: 0,
+          assetCount: 0,
+          phase: "estimating",
+        }
+      : null;
+  const effectiveScanPhase = effectiveScanProgress?.phase ?? "estimating";
 
   const progressPercent = exportProgress
     ? exportProgress.requestedCount > 0
       ? Math.round((exportProgress.processedCount / exportProgress.requestedCount) * 100)
       : 0
-    : progress && progress.totalContainers > 0
-      ? Math.round((progress.scannedContainers / progress.totalContainers) * 100)
+    : effectiveScanProgress && effectiveScanProgress.totalContainers > 0
+      ? Math.round(
+          (effectiveScanProgress.scannedContainers / effectiveScanProgress.totalContainers) * 100,
+        )
       : 0;
 
   const lifecycleDotClass =
@@ -1134,7 +1249,7 @@ function App() {
         <StatusStrip
           lifecycle={lifecycle}
           lifecycleDotClass={lifecycleDotClass}
-          progress={progress}
+          progress={effectiveScanProgress}
           exportProgress={exportProgress}
           progressPercent={progressPercent}
           statusLine={statusLine}
@@ -1220,7 +1335,14 @@ function App() {
           }}
         />
         {isExplorerLocked ? (
-          <ContentOverlay needsInstanceSelection={needsInstanceSelection} instances={instances} />
+          <ContentOverlay
+            needsInstanceSelection={needsInstanceSelection}
+            instances={instances}
+            progress={effectiveScanProgress}
+            progressPercent={progressPercent}
+            phaseLabel={scanPhaseLabel(effectiveScanPhase)}
+            statusLine={statusLine}
+          />
         ) : null}
       </main>
     </div>

@@ -52,6 +52,15 @@ export type ScanProgressEvent = {
   currentSource?: string;
 };
 
+export type ScanStatus = {
+  scanId: string;
+  lifecycle: ScanLifecycle;
+  scannedContainers: number;
+  totalContainers: number;
+  assetCount: number;
+  error?: string;
+};
+
 export type ScanCompletedEvent = {
   scanId: string;
   lifecycle: ScanLifecycle;
