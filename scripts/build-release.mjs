@@ -330,7 +330,7 @@ function buildLinuxWithDocker() {
 
   console.log(`[build] Building linux release bundles in Docker (${dockerPlatform}) for target(s): ${linuxTargetsValue}`);
 
-  const containerCommand = 'set -euo pipefail; bun install --frozen-lockfile; node scripts/build-release.mjs linux';
+  const containerCommand = 'set -euo pipefail; bun install --frozen-lockfile; bun scripts/build-release.mjs linux';
   const ok = run('docker', [
     'run',
     '--rm',
@@ -423,7 +423,7 @@ function buildTarget(target, { continueOnFailure = false } = {}) {
   }
 
   console.log(`[build] Collecting ${target} artifacts...`);
-  const collected = run('node', ['scripts/collect-release-artifacts.mjs', target]);
+  const collected = run('bun', ['scripts/collect-release-artifacts.mjs', target]);
   if (!collected) {
     if (continueOnFailure) {
       console.error(`[build] Artifact collection failed for ${target}.`);
