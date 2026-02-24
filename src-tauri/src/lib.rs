@@ -664,7 +664,6 @@ fn start_scan(
     req: StartScanRequest,
 ) -> Result<StartScanResponse, String> {
     let scan_id = Uuid::new_v4().to_string();
-    let estimated_total_containers = estimate_container_count(&req)?;
 
     {
         let mut scans = state
@@ -672,9 +671,7 @@ fn start_scan(
             .lock()
             .map_err(|_| "Failed to lock scans state".to_string())?;
 
-        let mut scan_state = ScanState::new();
-        scan_state.total_containers = estimated_total_containers;
-        scans.insert(scan_id.clone(), scan_state);
+        scans.insert(scan_id.clone(), ScanState::new());
     }
 
     emit_scan_progress(
@@ -682,7 +679,7 @@ fn start_scan(
         ScanProgressEvent {
             scan_id: scan_id.clone(),
             scanned_containers: 0,
-            total_containers: estimated_total_containers,
+            total_containers: 0,
             asset_count: 0,
             phase: ScanPhase::Estimating,
             current_source: None,
@@ -1148,19 +1145,7 @@ fn run_scan_worker_inner(
         .ok_or_else(|| "Failed to resolve Minecraft version from mmc-pack.json".to_string())?;
 
     let containers = collect_scan_containers(&prism_root, &instance_dir, &mc_version, req)?;
-    emit_scan_progress(
-        app,
-        ScanProgressEvent {
-            scan_id: scan_id.to_string(),
-            scanned_containers: 0,
-            total_containers: containers.len(),
-            asset_count: 0,
-            phase: ScanPhase::Fingerprinting,
-            current_source: None,
-        },
-    );
-
-    let resolved_containers = resolve_scan_containers(app, scan_id, containers)?;
+    let total_containers_hint = containers.len();
     let profile_key = build_scan_profile_key(
         &prism_root,
         &instance_dir,
@@ -1187,6 +1172,48 @@ fn run_scan_worker_inner(
     } else {
         (None, HashMap::new())
     };
+    let has_cached_snapshot = !cached_containers_by_id.is_empty();
+
+    if has_cached_snapshot {
+        let cached_asset_count = cached_containers_by_id
+            .values()
+            .map(|container| container.assets.len())
+            .sum::<usize>();
+
+        replace_scan_state_from_cached_containers(
+            app,
+            scan_id,
+            cached_containers_by_id.values(),
+            total_containers_hint,
+            total_containers_hint,
+        )?;
+        emit_scan_progress(
+            app,
+            ScanProgressEvent {
+                scan_id: scan_id.to_string(),
+                scanned_containers: total_containers_hint,
+                total_containers: total_containers_hint,
+                asset_count: cached_asset_count,
+                phase: ScanPhase::Scanning,
+                current_source: Some("cache".to_string()),
+            },
+        );
+        complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
+    } else {
+        emit_scan_progress(
+            app,
+            ScanProgressEvent {
+                scan_id: scan_id.to_string(),
+                scanned_containers: 0,
+                total_containers: total_containers_hint,
+                asset_count: 0,
+                phase: ScanPhase::Fingerprinting,
+                current_source: None,
+            },
+        );
+    }
+
+    let resolved_containers = resolve_scan_containers(app, scan_id, containers, !has_cached_snapshot)?;
 
     let total_containers = resolved_containers.len();
     let mut unchanged_cache = Vec::<CachedContainer>::new();
@@ -1206,11 +1233,27 @@ fn run_scan_worker_inner(
             changed_containers.push(resolved);
         }
     }
-
-    let cached_asset_count: usize = unchanged_cache
+    let removed_cached_containers = !cached_containers_by_id.is_empty();
+    let unchanged_asset_count: usize = unchanged_cache
         .iter()
         .map(|container| container.assets.len())
         .sum();
+
+    let needs_refresh = !changed_containers.is_empty() || removed_cached_containers;
+    if !needs_refresh {
+        if has_cached_snapshot {
+            persist_scan_cache_entry_async(
+                app,
+                cache_store,
+                profile_key,
+                unchanged_cache,
+                cached_created_at,
+            );
+            return Ok(());
+        }
+        complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
+        return Ok(());
+    }
 
     emit_scan_progress(
         app,
@@ -1218,35 +1261,28 @@ fn run_scan_worker_inner(
             scan_id: scan_id.to_string(),
             scanned_containers: unchanged_cache.len(),
             total_containers,
-            asset_count: cached_asset_count,
+            asset_count: unchanged_asset_count,
             phase: ScanPhase::Scanning,
-            current_source: Some("cache".to_string()),
+            current_source: Some(if has_cached_snapshot { "refresh" } else { "scan" }.to_string()),
         },
     );
 
-    {
-        let state = app.state::<AppState>();
-        let mut scans = state
-            .scans
-            .lock()
-            .map_err(|_| "Failed to lock scans state".to_string())?;
-
-        if let Some(scan) = scans.get_mut(scan_id) {
-            scan.total_containers = total_containers;
-            scan.scanned_containers = unchanged_cache.len();
-            for container in &unchanged_cache {
-                append_cached_assets_to_scan_state(scan, &container.assets);
-            }
-        }
-    }
-
-    if total_containers == 0 {
-        complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
-        return Ok(());
-    }
-
     if changed_containers.is_empty() {
+        replace_scan_state_from_cached_containers(
+            app,
+            scan_id,
+            unchanged_cache.iter(),
+            total_containers,
+            total_containers,
+        )?;
         complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
+        persist_scan_cache_entry_async(
+            app,
+            cache_store,
+            profile_key,
+            unchanged_cache,
+            cached_created_at,
+        );
         return Ok(());
     }
 
@@ -1316,10 +1352,13 @@ fn run_scan_worker_inner(
     let mut key_counts = rebuild_key_counts_from_cached_containers(&unchanged_cache);
     let mut scanned_containers = unchanged_cache.len();
     let mut scanned_cache_containers = Vec::<CachedContainer>::new();
+    let mut changed_asset_count = 0usize;
 
     while scanned_containers < total_containers {
         if is_scan_cancelled(app, scan_id)? {
-            complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Cancelled, None)?;
+            if !has_cached_snapshot {
+                complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Cancelled, None)?;
+            }
             return Ok(());
         }
 
@@ -1338,16 +1377,31 @@ fn run_scan_worker_inner(
                     fingerprint,
                     assets: assets.iter().map(CachedAssetRecord::from).collect(),
                 });
+                changed_asset_count += assets.len();
 
-                append_assets_chunk(
-                    app,
-                    scan_id,
-                    &assets,
-                    scanned_containers,
-                    total_containers,
-                    ScanPhase::Scanning,
-                    Some(source_name),
-                )?;
+                if has_cached_snapshot {
+                    emit_scan_progress(
+                        app,
+                        ScanProgressEvent {
+                            scan_id: scan_id.to_string(),
+                            scanned_containers,
+                            total_containers,
+                            asset_count: unchanged_asset_count + changed_asset_count,
+                            phase: ScanPhase::Scanning,
+                            current_source: Some(source_name),
+                        },
+                    );
+                } else {
+                    append_assets_chunk(
+                        app,
+                        scan_id,
+                        &assets,
+                        scanned_containers,
+                        total_containers,
+                        ScanPhase::Scanning,
+                        Some(source_name),
+                    )?;
+                }
             }
             Ok(ScanWorkerResult::Error(error)) => return Err(error),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1361,6 +1415,15 @@ fn run_scan_worker_inner(
 
     let mut all_cache_containers = unchanged_cache;
     all_cache_containers.extend(scanned_cache_containers);
+    if has_cached_snapshot {
+        replace_scan_state_from_cached_containers(
+            app,
+            scan_id,
+            all_cache_containers.iter(),
+            total_containers,
+            total_containers,
+        )?;
+    }
     complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
     persist_scan_cache_entry_async(
         app,
@@ -1369,6 +1432,40 @@ fn run_scan_worker_inner(
         all_cache_containers,
         cached_created_at,
     );
+
+    Ok(())
+}
+
+fn replace_scan_state_from_cached_containers<'a>(
+    app: &AppHandle,
+    scan_id: &str,
+    containers: impl Iterator<Item = &'a CachedContainer>,
+    scanned_containers: usize,
+    total_containers: usize,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut scans = state
+        .scans
+        .lock()
+        .map_err(|_| "Failed to lock scans state".to_string())?;
+
+    let scan = scans
+        .get_mut(scan_id)
+        .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
+
+    scan.scanned_containers = scanned_containers;
+    scan.total_containers = total_containers;
+    scan.assets.clear();
+    scan.asset_index.clear();
+    scan.search_records.clear();
+    scan.tree_children.clear();
+    scan.tree_children
+        .insert(ROOT_NODE_ID.to_string(), Vec::new());
+    scan.last_progress_emit_at = None;
+
+    for container in containers {
+        append_cached_assets_to_scan_state(scan, &container.assets);
+    }
 
     Ok(())
 }
@@ -1693,16 +1790,6 @@ fn is_scan_cancelled(app: &AppHandle, scan_id: &str) -> Result<bool, String> {
     Ok(scan.cancelled)
 }
 
-fn estimate_container_count(req: &StartScanRequest) -> Result<usize, String> {
-    let prism_root = expand_home(&req.prism_root);
-    validate_prism_root(&prism_root)?;
-    let instance_dir = resolve_instance_dir(&prism_root, &req.instance_folder)?;
-    let version = parse_minecraft_version(&instance_dir.join("mmc-pack.json"))
-        .ok_or_else(|| "Failed to resolve Minecraft version from mmc-pack.json".to_string())?;
-
-    Ok(collect_scan_containers(&prism_root, &instance_dir, &version, req)?.len())
-}
-
 fn collect_scan_containers(
     prism_root: &Path,
     instance_dir: &Path,
@@ -1829,6 +1916,7 @@ fn resolve_scan_containers(
     app: &AppHandle,
     scan_id: &str,
     containers: Vec<ScanContainer>,
+    emit_progress: bool,
 ) -> Result<Vec<ResolvedScanContainer>, String> {
     if containers.is_empty() {
         return Ok(Vec::new());
@@ -1904,17 +1992,19 @@ fn resolve_scan_containers(
                 let source = item.container.source_name.clone();
                 resolved[index] = Some(item);
 
-                emit_scan_progress(
-                    app,
-                    ScanProgressEvent {
-                        scan_id: scan_id.to_string(),
-                        scanned_containers: processed,
-                        total_containers: total,
-                        asset_count: 0,
-                        phase: ScanPhase::Fingerprinting,
-                        current_source: Some(source),
-                    },
-                );
+                if emit_progress {
+                    emit_scan_progress(
+                        app,
+                        ScanProgressEvent {
+                            scan_id: scan_id.to_string(),
+                            scanned_containers: processed,
+                            total_containers: total,
+                            asset_count: 0,
+                            phase: ScanPhase::Fingerprinting,
+                            current_source: Some(source),
+                        },
+                    );
+                }
             }
             Ok(FingerprintWorkerResult::Error(error)) => return Err(error),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
