@@ -192,6 +192,7 @@ function App() {
   const lastStatusAtRef = useRef(0);
   const expandedNodesRef = useRef<Set<string>>(new Set());
   const autoScanTimeoutRef = useRef<number | null>(null);
+  const progressRef = useRef<ScanProgressEvent | null>(null);
   const listParentRef = useRef<HTMLDivElement | null>(null);
   const previewContentRef = useRef<HTMLDivElement | null>(null);
   const previewPanelRef = useRef<HTMLElement | null>(null);
@@ -350,6 +351,10 @@ function App() {
     ],
   );
 
+  useEffect(() => {
+    progressRef.current = progress;
+  }, [progress]);
+
   const syncScanStatus = useCallback(
     async (targetScanId: string) => {
       if (isSyncingScanStatusRef.current) {
@@ -362,7 +367,10 @@ function App() {
           return;
         }
 
-        const currentProgress = progress && progress.scanId === status.scanId ? progress : null;
+        const currentProgress =
+          progressRef.current && progressRef.current.scanId === status.scanId
+            ? progressRef.current
+            : null;
         const totalContainers = Math.max(
           status.totalContainers,
           status.scannedContainers,
@@ -420,7 +428,7 @@ function App() {
         isSyncingScanStatusRef.current = false;
       }
     },
-    [progress, refreshVisibleTreeNodes],
+    [refreshVisibleTreeNodes],
   );
 
   const startScan = useCallback(async () => {
@@ -895,6 +903,10 @@ function App() {
       return;
     }
 
+    if (lifecycle === "scanning" || isStartingScan) {
+      return;
+    }
+
     autoScanTimeoutRef.current = window.setTimeout(() => {
       void startScan();
     }, AUTO_SCAN_DEBOUNCE_MS);
@@ -909,6 +921,8 @@ function App() {
     includeMods,
     includeResourcepacks,
     includeVanilla,
+    isStartingScan,
+    lifecycle,
     prismRootCommitted,
     selectedInstance,
     startScan,
