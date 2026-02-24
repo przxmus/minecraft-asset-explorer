@@ -674,6 +674,13 @@ fn start_scan(
         scans.insert(scan_id.clone(), ScanState::new());
     }
 
+    let _ = app.emit(
+        "scan://started",
+        serde_json::json!({
+            "scanId": scan_id,
+        }),
+    );
+
     emit_scan_progress(
         &app,
         ScanProgressEvent {
@@ -684,13 +691,6 @@ fn start_scan(
             phase: ScanPhase::Estimating,
             current_source: None,
         },
-    );
-
-    let _ = app.emit(
-        "scan://started",
-        serde_json::json!({
-            "scanId": scan_id,
-        }),
     );
 
     let scan_id_for_worker = scan_id.clone();
