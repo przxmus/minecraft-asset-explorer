@@ -24,6 +24,10 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, '..');
 const zigRunnerPath = resolve(repoRoot, 'scripts', 'tauri-zigbuild-runner.sh');
 const toolShimDir = resolve(repoRoot, '.codex-tool-shims');
+const linuxDockerBuildContext = resolve(repoRoot, 'scripts', 'docker');
+const linuxDockerfilePath = resolve(linuxDockerBuildContext, 'linux-builder.Dockerfile');
+const linuxDockerImage = process.env.BUILD_LINUX_DOCKER_IMAGE ?? 'minecraft-asset-explorer-linux-builder:bookworm';
+const linuxNodeModulesVolume = process.env.BUILD_LINUX_NODE_MODULES_VOLUME ?? 'minecraft-asset-explorer-linux-node-modules';
 
 if (!hostTarget) {
   console.error(`[build] Unsupported host platform: ${host}`);
@@ -156,6 +160,24 @@ function ensureWindowsNsisEnv() {
   return { PATH: `${toolShimDir}:${process.env.PATH}` };
 }
 
+function parseEnvTargetTriples(envKey) {
+  const raw = process.env[envKey];
+  if (!raw) {
+    return null;
+  }
+
+  const triples = raw
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (triples.length === 0) {
+    console.error(`[build] ${envKey} is set but empty. Provide one or more target triples.`);
+    process.exit(1);
+  }
+
+  return triples;
+}
+
 function resolveDefaultTargetTriple(target) {
   const preferred = preferredTargetTriples[target];
   const installed = preferred.find((triple) => installedRustTargets.has(triple));
@@ -173,25 +195,119 @@ function resolveDefaultTargetTriple(target) {
 
 function resolveTargetTriples(target) {
   const envKey = `TAURI_TARGET_${target.toUpperCase()}`;
-  const raw = process.env[envKey];
-  if (!raw) {
+  const fromEnv = parseEnvTargetTriples(envKey);
+  if (!fromEnv) {
     return [resolveDefaultTargetTriple(target)];
   }
 
-  const triples = raw
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
+  return fromEnv;
+}
 
-  if (triples.length === 0) {
-    console.error(`[build] ${envKey} is set but empty. Provide one or more target triples.`);
-    process.exit(1);
+function resolveLinuxDockerTargetTriples() {
+  const fromEnv = parseEnvTargetTriples('TAURI_TARGET_LINUX');
+  if (fromEnv) {
+    return fromEnv;
   }
 
-  return triples;
+  // Build Linux natively inside the container to avoid host cross-linker/pkg-config issues.
+  return ['x86_64-unknown-linux-gnu'];
+}
+
+function resolveLinuxDockerPlatform(triples) {
+  const override = process.env.BUILD_LINUX_DOCKER_PLATFORM;
+  if (override) {
+    return override;
+  }
+
+  return triples.some((triple) => triple.includes('aarch64')) ? 'linux/arm64' : 'linux/amd64';
+}
+
+function dockerImageExists(image) {
+  return runQuiet('docker', ['image', 'inspect', image]).ok;
+}
+
+function ensureLinuxDockerImage() {
+  if (!commandExists('docker')) {
+    console.error('[build] Docker is required for Linux builds on non-Linux hosts.');
+    console.error('[build] Install Docker Desktop and rerun, or set BUILD_LINUX_USE_DOCKER=0 to use direct cross-compilation.');
+    return false;
+  }
+
+  const forceRebuild = process.env.BUILD_REFRESH_LINUX_DOCKER_IMAGE === '1';
+  if (!forceRebuild && dockerImageExists(linuxDockerImage)) {
+    return true;
+  }
+
+  console.log(`[build] Building Linux builder image (${linuxDockerImage})...`);
+  const built = run('docker', [
+    'build',
+    '--file',
+    linuxDockerfilePath,
+    '--tag',
+    linuxDockerImage,
+    linuxDockerBuildContext
+  ]);
+  if (!built) {
+    console.error('[build] Failed to build Linux Docker image.');
+    return false;
+  }
+
+  return true;
+}
+
+function buildLinuxWithDocker() {
+  if (!ensureLinuxDockerImage()) {
+    return false;
+  }
+
+  const linuxTriples = resolveLinuxDockerTargetTriples();
+  const dockerPlatform = resolveLinuxDockerPlatform(linuxTriples);
+  const linuxTargetsValue = linuxTriples.join(',');
+  console.log(`[build] Building linux release bundles in Docker (${dockerPlatform}) for target(s): ${linuxTargetsValue}`);
+
+  const containerCommand = 'set -euo pipefail; bun install --frozen-lockfile; node scripts/build-release.mjs linux';
+  const ok = run('docker', [
+    'run',
+    '--rm',
+    '--platform',
+    dockerPlatform,
+    '-v',
+    `${repoRoot}:/workspace`,
+    '-v',
+    `${linuxNodeModulesVolume}:/workspace/node_modules`,
+    '-w',
+    '/workspace',
+    '-e',
+    `TAURI_TARGET_LINUX=${linuxTargetsValue}`,
+    '-e',
+    'CI=1',
+    linuxDockerImage,
+    'bash',
+    '-lc',
+    containerCommand
+  ]);
+
+  if (!ok) {
+    console.error('[build] Linux Docker build failed.');
+    return false;
+  }
+
+  return true;
 }
 
 function buildTarget(target, { continueOnFailure = false } = {}) {
+  if (target === 'linux' && host !== 'linux' && process.env.BUILD_LINUX_USE_DOCKER !== '0') {
+    const ok = buildLinuxWithDocker();
+    if (!ok) {
+      if (continueOnFailure) {
+        console.error('[build] linux build failed in Docker.');
+        return false;
+      }
+      process.exit(1);
+    }
+    return true;
+  }
+
   const triples = resolveTargetTriples(target);
 
   for (const triple of triples) {
