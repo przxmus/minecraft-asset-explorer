@@ -712,6 +712,10 @@ fn scan_cache_manifest_path(cache_root: &Path) -> PathBuf {
 }
 
 fn scan_cache_snapshot_file_name(cache_key: &str) -> String {
+    format!("{:016x}.bin", fnv1a64(cache_key))
+}
+
+fn scan_cache_snapshot_legacy_file_name(cache_key: &str) -> String {
     format!("{:016x}.json", fnv1a64(cache_key))
 }
 
@@ -719,17 +723,31 @@ fn scan_cache_snapshot_path(cache_root: &Path, cache_key: &str) -> PathBuf {
     cache_root.join(scan_cache_snapshot_file_name(cache_key))
 }
 
+fn scan_cache_snapshot_legacy_path(cache_root: &Path, cache_key: &str) -> PathBuf {
+    cache_root.join(scan_cache_snapshot_legacy_file_name(cache_key))
+}
+
 fn has_cached_snapshot(app: &AppHandle, cache_key: &str) -> bool {
     let Ok(cache_root) = scan_cache_root(app) else {
         return false;
     };
     scan_cache_snapshot_path(&cache_root, cache_key).is_file()
+        || scan_cache_snapshot_legacy_path(&cache_root, cache_key).is_file()
 }
 
 fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let temp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     let bytes = serde_json::to_vec(value)
         .map_err(|error| format!("Failed to serialize {}: {error}", path.display()))?;
+    fs::write(&temp_path, bytes)
+        .map_err(|error| format!("Failed to write {}: {error}", temp_path.display()))?;
+    fs::rename(&temp_path, path)
+        .map_err(|error| format!("Failed to replace {}: {error}", path.display()))?;
+    Ok(())
+}
+
+fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     fs::write(&temp_path, bytes)
         .map_err(|error| format!("Failed to write {}: {error}", temp_path.display()))?;
     fs::rename(&temp_path, path)
@@ -761,6 +779,8 @@ fn remove_cache_entry(cache_root: &Path, manifest: &mut ScanCacheManifest, cache
     let file_name = scan_cache_snapshot_file_name(cache_key);
     let path = cache_root.join(&file_name);
     let _ = fs::remove_file(path);
+    let legacy_path = scan_cache_snapshot_legacy_path(cache_root, cache_key);
+    let _ = fs::remove_file(legacy_path);
     manifest.entries.remove(cache_key);
 }
 
@@ -798,43 +818,88 @@ fn load_cached_snapshot(app: &AppHandle, cache_key: &str) -> Result<Option<ScanS
     let cache_root = scan_cache_root(app)?;
     let mut manifest = load_scan_cache_manifest(&cache_root)?;
     let snapshot_path = scan_cache_snapshot_path(&cache_root, cache_key);
-    if !snapshot_path.is_file() {
+    let legacy_path = scan_cache_snapshot_legacy_path(&cache_root, cache_key);
+    let (mut parsed, source_path, was_legacy_json) = if snapshot_path.is_file() {
+        let bytes = match fs::read(&snapshot_path) {
+            Ok(value) => value,
+            Err(_) => {
+                remove_cache_entry(&cache_root, &mut manifest, cache_key);
+                let _ = save_scan_cache_manifest(&cache_root, &manifest);
+                return Ok(None);
+            }
+        };
+        let parsed: ScanSnapshot = match bincode::deserialize(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                remove_cache_entry(&cache_root, &mut manifest, cache_key);
+                let _ = save_scan_cache_manifest(&cache_root, &manifest);
+                return Ok(None);
+            }
+        };
+        (parsed, snapshot_path.clone(), false)
+    } else if legacy_path.is_file() {
+        let data = match fs::read_to_string(&legacy_path) {
+            Ok(value) => value,
+            Err(_) => {
+                manifest.entries.remove(cache_key);
+                let _ = fs::remove_file(&legacy_path);
+                let _ = save_scan_cache_manifest(&cache_root, &manifest);
+                return Ok(None);
+            }
+        };
+        let parsed: ScanSnapshot = match serde_json::from_str(&data) {
+            Ok(value) => value,
+            Err(_) => {
+                manifest.entries.remove(cache_key);
+                let _ = fs::remove_file(&legacy_path);
+                let _ = save_scan_cache_manifest(&cache_root, &manifest);
+                return Ok(None);
+            }
+        };
+        (parsed, legacy_path.clone(), true)
+    } else {
         manifest.entries.remove(cache_key);
         let _ = save_scan_cache_manifest(&cache_root, &manifest);
         return Ok(None);
-    }
+    };
 
-    let data = match fs::read_to_string(&snapshot_path) {
-        Ok(value) => value,
-        Err(_) => {
-            remove_cache_entry(&cache_root, &mut manifest, cache_key);
-            let _ = save_scan_cache_manifest(&cache_root, &manifest);
-            return Ok(None);
-        }
-    };
-    let parsed: ScanSnapshot = match serde_json::from_str(&data) {
-        Ok(value) => value,
-        Err(_) => {
-            remove_cache_entry(&cache_root, &mut manifest, cache_key);
-            let _ = save_scan_cache_manifest(&cache_root, &manifest);
-            return Ok(None);
-        }
-    };
     if parsed.schema_version != SCAN_CACHE_SCHEMA_VERSION {
         remove_cache_entry(&cache_root, &mut manifest, cache_key);
+        let _ = fs::remove_file(&legacy_path);
         let _ = save_scan_cache_manifest(&cache_root, &manifest);
         return Ok(None);
     }
 
+    parsed.last_used_at = unix_timestamp_ms();
+    if was_legacy_json {
+        if let Ok(bytes) = bincode::serialize(&parsed) {
+            let _ = write_bytes_atomically(&snapshot_path, &bytes);
+            let _ = fs::remove_file(&legacy_path);
+        }
+    }
+
+    let canonical_path = if snapshot_path.is_file() {
+        snapshot_path
+    } else {
+        source_path
+    };
     let now = unix_timestamp_ms();
     let entry = manifest
         .entries
         .entry(cache_key.to_string())
         .or_insert(ScanCacheManifestEntry {
-            file_name: scan_cache_snapshot_file_name(cache_key),
-            size_bytes: fs::metadata(&snapshot_path).map(|meta| meta.len()).unwrap_or(0),
+            file_name: canonical_path
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| scan_cache_snapshot_file_name(cache_key)),
+            size_bytes: fs::metadata(&canonical_path).map(|meta| meta.len()).unwrap_or(0),
             last_accessed_at: now,
         });
+    entry.file_name = canonical_path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| scan_cache_snapshot_file_name(cache_key));
+    entry.size_bytes = fs::metadata(&canonical_path).map(|meta| meta.len()).unwrap_or(0);
     entry.last_accessed_at = now;
     let _ = save_scan_cache_manifest(&cache_root, &manifest);
     Ok(Some(parsed))
@@ -844,7 +909,11 @@ fn save_snapshot_to_cache(app: &AppHandle, snapshot: &ScanSnapshot) -> Result<()
     let cache_root = scan_cache_root(app)?;
     let mut manifest = load_scan_cache_manifest(&cache_root)?;
     let snapshot_path = scan_cache_snapshot_path(&cache_root, &snapshot.cache_key);
-    write_json_atomically(&snapshot_path, snapshot)?;
+    let bytes = bincode::serialize(snapshot)
+        .map_err(|error| format!("Failed to serialize snapshot {}: {error}", snapshot.cache_key))?;
+    write_bytes_atomically(&snapshot_path, &bytes)?;
+    let legacy_path = scan_cache_snapshot_legacy_path(&cache_root, &snapshot.cache_key);
+    let _ = fs::remove_file(legacy_path);
     let size_bytes = fs::metadata(&snapshot_path)
         .map(|meta| meta.len())
         .map_err(|error| format!("Failed to stat cache snapshot {}: {error}", snapshot_path.display()))?;
