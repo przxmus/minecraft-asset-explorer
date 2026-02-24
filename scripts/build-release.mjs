@@ -345,7 +345,7 @@ function buildLinuxWithDocker() {
     '-e',
     `TAURI_TARGET_LINUX=${linuxTargetsValue}`,
     '-e',
-    'CI=1',
+    'CI=true',
     linuxDockerImage,
     'bash',
     '-lc',
