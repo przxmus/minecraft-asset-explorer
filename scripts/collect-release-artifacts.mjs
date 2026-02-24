@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 
 const platform = process.argv[2];
@@ -29,6 +29,11 @@ const bundleDirs = {
 function walk(dir, visitor) {
   for (const entry of readdirSync(dir)) {
     const fullPath = join(dir, entry);
+    const lst = lstatSync(fullPath);
+    if (lst.isSymbolicLink()) {
+      // Linux AppImage bundles include symlinks that can be dangling on other hosts.
+      continue;
+    }
     const st = statSync(fullPath);
     if (st.isDirectory()) {
       walk(fullPath, visitor);
