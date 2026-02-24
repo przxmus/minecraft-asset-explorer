@@ -50,7 +50,7 @@ const SEARCH_PAGE_SIZE = 320;
 const SEARCH_DEBOUNCE_MS = 260;
 const AUTO_SCAN_DEBOUNCE_MS = 260;
 const PROGRESS_STATUS_THROTTLE_MS = 250;
-const SCAN_STATUS_POLL_MS = 500;
+const SCAN_STATUS_POLL_MS = 1000;
 const PREVIEW_TOP_GAP_PX = 14;
 const RELEASES_LATEST_API_URL =
   "https://api.github.com/repos/przxmus/minecraft-asset-explorer/releases/latest";
@@ -185,6 +185,7 @@ function App() {
   const activeExportOperationIdRef = useRef<string | null>(null);
   const lastScanProgressAtRef = useRef(0);
   const terminalScanSyncRef = useRef<string | null>(null);
+  const isSyncingScanStatusRef = useRef(false);
   const searchRequestSeqRef = useRef(0);
   const isSearchLoadingRef = useRef(false);
   const hasMoreSearchRef = useRef(false);
@@ -353,6 +354,10 @@ function App() {
 
   const syncScanStatus = useCallback(
     async (targetScanId: string) => {
+      if (isSyncingScanStatusRef.current) {
+        return;
+      }
+      isSyncingScanStatusRef.current = true;
       try {
         const status = await invoke<ScanStatus>("get_scan_status", { scanId: targetScanId });
         if (status.scanId !== activeScanIdRef.current) {
@@ -403,6 +408,8 @@ function App() {
         if (targetScanId === activeScanIdRef.current) {
           setStatusLine(String(error));
         }
+      } finally {
+        isSyncingScanStatusRef.current = false;
       }
     },
     [progress, refreshVisibleTreeNodes],
@@ -443,6 +450,7 @@ function App() {
       setLifecycle("scanning");
       terminalScanSyncRef.current = null;
       lastScanProgressAtRef.current = 0;
+      isSyncingScanStatusRef.current = false;
       setStatusLine("Estimating containers · 0/0 containers · 0 assets");
 
       const response = await invoke<{ scanId: string }>("start_scan", {
@@ -465,10 +473,7 @@ function App() {
         phase: "estimating",
       });
       setStatusLine("Estimating containers · 0/0 containers · 0 assets");
-      await syncScanStatus(response.scanId);
-
-      await refreshVisibleTreeNodes(response.scanId);
-      setScanRefreshToken((value) => value + 1);
+      void syncScanStatus(response.scanId);
     } catch (error) {
       setStatusLine(String(error));
       setLifecycle("error");
@@ -480,7 +485,6 @@ function App() {
     includeResourcepacks,
     includeVanilla,
     prismRootCommitted,
-    refreshVisibleTreeNodes,
     resetSearchState,
     selectedInstance,
     syncScanStatus,
