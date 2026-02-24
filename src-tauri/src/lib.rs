@@ -352,7 +352,6 @@ enum ScanPhase {
     Estimating,
     Fingerprinting,
     Scanning,
-    Caching,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1171,7 +1170,7 @@ fn run_scan_worker_inner(
         req.include_resourcepacks,
     );
 
-    let mut cache_store = load_scan_cache_store(app).unwrap_or_default();
+    let cache_store = load_scan_cache_store(app).unwrap_or_default();
     let cached_entry = cache_store
         .entries
         .iter()
@@ -1234,49 +1233,11 @@ fn run_scan_worker_inner(
     }
 
     if total_containers == 0 {
-        emit_scan_progress(
-            app,
-            ScanProgressEvent {
-                scan_id: scan_id.to_string(),
-                scanned_containers: 0,
-                total_containers: 0,
-                asset_count: 0,
-                phase: ScanPhase::Caching,
-                current_source: Some("cache".to_string()),
-            },
-        );
-
-        persist_scan_cache_entry(
-            app,
-            &mut cache_store,
-            profile_key,
-            unchanged_cache,
-            cached_entry.as_ref().map(|entry| entry.created_at_unix_ms),
-        );
         complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
         return Ok(());
     }
 
     if changed_containers.is_empty() {
-        emit_scan_progress(
-            app,
-            ScanProgressEvent {
-                scan_id: scan_id.to_string(),
-                scanned_containers: total_containers,
-                total_containers,
-                asset_count: preloaded_assets.len(),
-                phase: ScanPhase::Caching,
-                current_source: Some("cache".to_string()),
-            },
-        );
-
-        persist_scan_cache_entry(
-            app,
-            &mut cache_store,
-            profile_key,
-            unchanged_cache,
-            cached_entry.as_ref().map(|entry| entry.created_at_unix_ms),
-        );
         complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
         return Ok(());
     }
@@ -1392,27 +1353,15 @@ fn run_scan_worker_inner(
 
     let mut all_cache_containers = unchanged_cache;
     all_cache_containers.extend(scanned_cache_containers);
-    emit_scan_progress(
+    complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
+    persist_scan_cache_entry_async(
         app,
-        ScanProgressEvent {
-            scan_id: scan_id.to_string(),
-            scanned_containers,
-            total_containers,
-            asset_count: get_scan_asset_count(app, scan_id),
-            phase: ScanPhase::Caching,
-            current_source: None,
-        },
-    );
-
-    persist_scan_cache_entry(
-        app,
-        &mut cache_store,
+        cache_store,
         profile_key,
         all_cache_containers,
         cached_entry.as_ref().map(|entry| entry.created_at_unix_ms),
     );
 
-    complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
     Ok(())
 }
 
@@ -1502,7 +1451,6 @@ fn save_scan_cache_store(app: &AppHandle, store: &ScanCacheStore) -> Result<(), 
 }
 
 fn persist_scan_cache_entry(
-    app: &AppHandle,
     store: &mut ScanCacheStore,
     profile_key: String,
     containers: Vec<CachedContainer>,
@@ -1529,7 +1477,25 @@ fn persist_scan_cache_entry(
     }
 
     prune_scan_cache_entries(store, now);
-    let _ = save_scan_cache_store(app, store);
+}
+
+fn persist_scan_cache_entry_async(
+    app: &AppHandle,
+    mut store: ScanCacheStore,
+    profile_key: String,
+    containers: Vec<CachedContainer>,
+    existing_created_at: Option<u64>,
+) {
+    persist_scan_cache_entry(
+        &mut store,
+        profile_key,
+        containers,
+        existing_created_at,
+    );
+    let app = app.clone();
+    thread::spawn(move || {
+        let _ = save_scan_cache_store(&app, &store);
+    });
 }
 
 fn prune_scan_cache_entries(store: &mut ScanCacheStore, now_unix_ms: u64) {
@@ -2887,15 +2853,6 @@ fn is_export_cancelled(app: &AppHandle, operation_id: &str) -> bool {
 
 fn emit_scan_progress(app: &AppHandle, event: ScanProgressEvent) {
     let _ = app.emit("scan://progress", event);
-}
-
-fn get_scan_asset_count(app: &AppHandle, scan_id: &str) -> usize {
-    let state = app.state::<AppState>();
-    let Ok(scans) = state.scans.lock() else {
-        return 0;
-    };
-
-    scans.get(scan_id).map(|scan| scan.assets.len()).unwrap_or(0)
 }
 
 fn emit_export_progress(app: &AppHandle, event: ExportProgressEvent) {
