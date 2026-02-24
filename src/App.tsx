@@ -96,8 +96,6 @@ function scanPhaseLabel(phase: ScanPhase): string {
   switch (phase) {
     case "estimating":
       return "Estimating containers";
-    case "fingerprinting":
-      return "Fingerprinting containers";
     case "scanning":
       return "Scanning assets";
     default:

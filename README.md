@@ -35,7 +35,7 @@ Find, preview, and export Minecraft assets from your Prism Launcher instances in
 - `Sources`: choose whether to include vanilla assets, mods, and/or resource packs
 
 The app starts scanning automatically once those are set.
-Scan progress is phase-aware (`estimating`, `fingerprinting`, `scanning`, `caching`) and starts immediately.
+Scan progress is phase-aware (`estimating`, `scanning`) and starts immediately.
 
 ### 2) Find Assets Fast
 
