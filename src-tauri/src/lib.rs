@@ -4,9 +4,8 @@ use ffmpeg_sidecar::download::{download_ffmpeg_package, ffmpeg_download_url, unp
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     env, fs,
-    hash::{Hash, Hasher},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -15,7 +14,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use strsim::damerau_levenshtein;
 use tauri::{
@@ -27,11 +26,6 @@ use walkdir::WalkDir;
 use zip::ZipArchive;
 
 const ROOT_NODE_ID: &str = "root";
-const SCAN_CACHE_SCHEMA_VERSION: u32 = 2;
-const SCAN_CACHE_FILE_NAME: &str = "scan-cache-v2.json";
-const SCAN_CACHE_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
-const SCAN_CACHE_MAX_ENTRIES: usize = 20;
-const MAX_SCAN_FINGERPRINT_WORKERS: usize = 6;
 const MAX_SCAN_WORKERS: usize = 6;
 const MAX_EXPORT_WORKERS: usize = 16;
 
@@ -51,80 +45,6 @@ impl ExportOperationState {
     fn new() -> Self {
         Self { cancelled: false }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ScanCacheStore {
-    schema_version: u32,
-    entries: Vec<ScanCacheEntry>,
-}
-
-impl Default for ScanCacheStore {
-    fn default() -> Self {
-        Self {
-            schema_version: SCAN_CACHE_SCHEMA_VERSION,
-            entries: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ScanCacheEntry {
-    profile_key: String,
-    created_at_unix_ms: u64,
-    last_used_at_unix_ms: u64,
-    containers: Vec<CachedContainer>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CachedContainer {
-    container_id: String,
-    fingerprint: ContainerFingerprint,
-    assets: Vec<CachedAssetRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "camelCase")]
-enum ContainerFingerprint {
-    ArchiveLike {
-        path: String,
-        size: u64,
-        mtime_unix_ms: u64,
-    },
-    AssetsDir {
-        path: String,
-        file_count: u64,
-        total_size: u64,
-        latest_mtime_unix_ms: u64,
-        rolling_hash: u64,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CachedAssetRecord {
-    asset_id: String,
-    key: String,
-    source_type: AssetSourceType,
-    source_name: String,
-    namespace: String,
-    relative_asset_path: String,
-    extension: String,
-    is_image: bool,
-    is_audio: bool,
-    container_path: String,
-    container_type: AssetContainerType,
-    entry_path: String,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedScanContainer {
-    container: ScanContainer,
-    container_id: String,
-    fingerprint: ContainerFingerprint,
 }
 
 #[derive(Debug, Clone)]
@@ -256,44 +176,6 @@ struct AssetRecord {
     entry_path: String,
 }
 
-impl From<&AssetRecord> for CachedAssetRecord {
-    fn from(value: &AssetRecord) -> Self {
-        Self {
-            asset_id: value.asset_id.clone(),
-            key: value.key.clone(),
-            source_type: value.source_type.clone(),
-            source_name: value.source_name.clone(),
-            namespace: value.namespace.clone(),
-            relative_asset_path: value.relative_asset_path.clone(),
-            extension: value.extension.clone(),
-            is_image: value.is_image,
-            is_audio: value.is_audio,
-            container_path: value.container_path.clone(),
-            container_type: value.container_type.clone(),
-            entry_path: value.entry_path.clone(),
-        }
-    }
-}
-
-impl From<CachedAssetRecord> for AssetRecord {
-    fn from(value: CachedAssetRecord) -> Self {
-        Self {
-            asset_id: value.asset_id,
-            key: value.key,
-            source_type: value.source_type,
-            source_name: value.source_name,
-            namespace: value.namespace,
-            relative_asset_path: value.relative_asset_path,
-            extension: value.extension,
-            is_image: value.is_image,
-            is_audio: value.is_audio,
-            container_path: value.container_path,
-            container_type: value.container_type,
-            entry_path: value.entry_path,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TreeNode {
@@ -351,7 +233,6 @@ enum ScanLifecycle {
 #[serde(rename_all = "lowercase")]
 enum ScanPhase {
     Estimating,
-    Fingerprinting,
     Scanning,
 }
 
@@ -831,7 +712,9 @@ fn search_assets(req: SearchRequest, state: State<'_, AppState>) -> Result<Searc
             matched.push(index);
         }
 
-        matched.sort_unstable_by(|left, right| idle_asset_cmp(&scan.assets[*left], &scan.assets[*right]));
+        matched.sort_unstable_by(|left, right| {
+            idle_asset_cmp(&scan.assets[*left], &scan.assets[*right])
+        });
         let total = matched.len();
         let assets = matched
             .into_iter()
@@ -1146,138 +1029,28 @@ fn run_scan_worker_inner(
         .ok_or_else(|| "Failed to resolve Minecraft version from mmc-pack.json".to_string())?;
 
     let containers = collect_scan_containers(&prism_root, &instance_dir, &mc_version, req)?;
-    let total_containers_hint = containers.len();
-    let profile_key = build_scan_profile_key(
-        &prism_root,
-        &instance_dir,
-        &mc_version,
-        req.include_vanilla,
-        req.include_mods,
-        req.include_resourcepacks,
-    );
-
-    let mut cache_store = load_scan_cache_store(app).unwrap_or_default();
-    let cached_entry_index = cache_store
-        .entries
-        .iter()
-        .position(|entry| entry.profile_key == profile_key);
-    let (cached_created_at, mut cached_containers_by_id) = if let Some(index) = cached_entry_index {
-        let entry = cache_store.entries.swap_remove(index);
-        let created_at = entry.created_at_unix_ms;
-        let containers = entry
-            .containers
-            .into_iter()
-            .map(|container| (container.container_id.clone(), container))
-            .collect::<HashMap<_, _>>();
-        (Some(created_at), containers)
-    } else {
-        (None, HashMap::new())
-    };
-    let has_cached_snapshot = !cached_containers_by_id.is_empty();
-
-    if has_cached_snapshot {
-        replace_scan_state_from_cached_containers(
-            app,
-            scan_id,
-            cached_containers_by_id.values(),
-            total_containers_hint,
-            total_containers_hint,
-            Some("cache"),
-        )?;
-        complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
-    } else {
-        emit_scan_progress(
-            app,
-            ScanProgressEvent {
-                scan_id: scan_id.to_string(),
-                scanned_containers: 0,
-                total_containers: total_containers_hint,
-                asset_count: 0,
-                phase: ScanPhase::Fingerprinting,
-                current_source: None,
-            },
-        );
-    }
-
-    let resolved_containers = resolve_scan_containers(app, scan_id, containers, !has_cached_snapshot)?;
-
-    let total_containers = resolved_containers.len();
-    let mut unchanged_cache = Vec::<CachedContainer>::new();
-    let mut changed_containers = Vec::<ResolvedScanContainer>::new();
-    for resolved in resolved_containers {
-        let cached = cached_containers_by_id.remove(&resolved.container_id);
-        let unchanged = cached
-            .as_ref()
-            .map(|item| item.fingerprint == resolved.fingerprint)
-            .unwrap_or(false);
-
-        if unchanged {
-            if let Some(cached_container) = cached {
-                unchanged_cache.push(cached_container);
-            }
-        } else {
-            changed_containers.push(resolved);
-        }
-    }
-    let removed_cached_containers = !cached_containers_by_id.is_empty();
-    let unchanged_asset_count: usize = unchanged_cache
-        .iter()
-        .map(|container| container.assets.len())
-        .sum();
-
-    let needs_refresh = !changed_containers.is_empty() || removed_cached_containers;
-    if !needs_refresh {
-        if has_cached_snapshot {
-            persist_scan_cache_entry_async(
-                app,
-                cache_store,
-                profile_key,
-                unchanged_cache,
-                cached_created_at,
-            );
-            return Ok(());
-        }
-        complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
-        return Ok(());
-    }
+    let total_containers = containers.len();
 
     emit_scan_progress(
         app,
         ScanProgressEvent {
             scan_id: scan_id.to_string(),
-            scanned_containers: unchanged_cache.len(),
+            scanned_containers: 0,
             total_containers,
-            asset_count: unchanged_asset_count,
+            asset_count: 0,
             phase: ScanPhase::Scanning,
-            current_source: Some(if has_cached_snapshot { "refresh" } else { "scan" }.to_string()),
+            current_source: None,
         },
     );
 
-    if changed_containers.is_empty() {
-        replace_scan_state_from_cached_containers(
-            app,
-            scan_id,
-            unchanged_cache.iter(),
-            total_containers,
-            total_containers,
-            Some("cache-refresh"),
-        )?;
+    if total_containers == 0 {
         complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
-        persist_scan_cache_entry_async(
-            app,
-            cache_store,
-            profile_key,
-            unchanged_cache,
-            cached_created_at,
-        );
         return Ok(());
     }
 
     enum ScanWorkerResult {
         Container {
             source_name: String,
-            container_id: String,
-            fingerprint: ContainerFingerprint,
             candidates: Vec<AssetCandidate>,
         },
         Error(String),
@@ -1287,11 +1060,11 @@ fn run_scan_worker_inner(
         .map(|value| value.get().saturating_sub(2))
         .unwrap_or(1)
         .clamp(1, MAX_SCAN_WORKERS)
-        .min(changed_containers.len());
+        .min(total_containers);
 
     let (sender, receiver) = mpsc::channel::<ScanWorkerResult>();
     let next_index = Arc::new(AtomicUsize::new(0));
-    let containers = Arc::new(changed_containers);
+    let containers = Arc::new(containers);
     let scan_id_owned = scan_id.to_string();
 
     for _ in 0..workers {
@@ -1311,14 +1084,12 @@ fn run_scan_worker_inner(
                 break;
             }
 
-            let resolved = &containers[index];
-            match scan_container(&resolved.container) {
+            let container = &containers[index];
+            match scan_container(container) {
                 Ok(candidates) => {
                     if sender
                         .send(ScanWorkerResult::Container {
-                            source_name: resolved.container.source_name.clone(),
-                            container_id: resolved.container_id.clone(),
-                            fingerprint: resolved.fingerprint.clone(),
+                            source_name: container.source_name.clone(),
                             candidates,
                         })
                         .is_err()
@@ -1336,59 +1107,31 @@ fn run_scan_worker_inner(
 
     drop(sender);
 
-    let mut key_counts = rebuild_key_counts_from_cached_containers(&unchanged_cache);
-    let mut scanned_containers = unchanged_cache.len();
-    let mut scanned_cache_containers = Vec::<CachedContainer>::new();
-    let mut changed_asset_count = 0usize;
+    let mut key_counts = HashMap::<String, usize>::new();
+    let mut scanned_containers = 0usize;
 
     while scanned_containers < total_containers {
         if is_scan_cancelled(app, scan_id)? {
-            if !has_cached_snapshot {
-                complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Cancelled, None)?;
-            }
+            complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Cancelled, None)?;
             return Ok(());
         }
 
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(ScanWorkerResult::Container {
                 source_name,
-                container_id,
-                fingerprint,
                 candidates,
             }) => {
                 scanned_containers += 1;
                 let assets = finalize_assets(candidates, &mut key_counts);
-
-                scanned_cache_containers.push(CachedContainer {
-                    container_id,
-                    fingerprint,
-                    assets: assets.iter().map(CachedAssetRecord::from).collect(),
-                });
-                changed_asset_count += assets.len();
-
-                if has_cached_snapshot {
-                    emit_scan_progress(
-                        app,
-                        ScanProgressEvent {
-                            scan_id: scan_id.to_string(),
-                            scanned_containers,
-                            total_containers,
-                            asset_count: unchanged_asset_count + changed_asset_count,
-                            phase: ScanPhase::Scanning,
-                            current_source: Some(source_name),
-                        },
-                    );
-                } else {
-                    append_assets_chunk(
-                        app,
-                        scan_id,
-                        &assets,
-                        scanned_containers,
-                        total_containers,
-                        ScanPhase::Scanning,
-                        Some(source_name),
-                    )?;
-                }
+                append_assets_chunk(
+                    app,
+                    scan_id,
+                    &assets,
+                    scanned_containers,
+                    total_containers,
+                    ScanPhase::Scanning,
+                    Some(source_name),
+                )?;
             }
             Ok(ScanWorkerResult::Error(error)) => return Err(error),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1400,152 +1143,9 @@ fn run_scan_worker_inner(
         return Err("Scan workers disconnected before processing all containers".to_string());
     }
 
-    let mut all_cache_containers = unchanged_cache;
-    all_cache_containers.extend(scanned_cache_containers);
-    if has_cached_snapshot {
-        replace_scan_state_from_cached_containers(
-            app,
-            scan_id,
-            all_cache_containers.iter(),
-            total_containers,
-            total_containers,
-            Some("cache-finalize"),
-        )?;
-    }
     complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
-    persist_scan_cache_entry_async(
-        app,
-        cache_store,
-        profile_key,
-        all_cache_containers,
-        cached_created_at,
-    );
 
     Ok(())
-}
-
-fn replace_scan_state_from_cached_containers<'a>(
-    app: &AppHandle,
-    scan_id: &str,
-    containers: impl Iterator<Item = &'a CachedContainer>,
-    scanned_containers: usize,
-    total_containers: usize,
-    progress_source: Option<&str>,
-) -> Result<(), String> {
-    let containers = containers.collect::<Vec<_>>();
-    {
-        let state = app.state::<AppState>();
-        let mut scans = state
-            .scans
-            .lock()
-            .map_err(|_| "Failed to lock scans state".to_string())?;
-
-        let scan = scans
-            .get_mut(scan_id)
-            .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
-
-        scan.scanned_containers = 0;
-        scan.total_containers = total_containers;
-        scan.assets.clear();
-        scan.asset_index.clear();
-        scan.search_records.clear();
-        scan.tree_children.clear();
-        scan.tree_children
-            .insert(ROOT_NODE_ID.to_string(), Vec::new());
-        scan.last_progress_emit_at = None;
-    }
-
-    let mut last_progress_emit_at = Instant::now() - Duration::from_millis(200);
-    for (index, container) in containers.iter().enumerate() {
-        let interim_scanned = if containers.is_empty() {
-            scanned_containers
-        } else {
-            ((index + 1) * scanned_containers) / containers.len()
-        };
-
-        let asset_count = {
-            let state = app.state::<AppState>();
-            let mut scans = state
-                .scans
-                .lock()
-                .map_err(|_| "Failed to lock scans state".to_string())?;
-
-            let scan = scans
-                .get_mut(scan_id)
-                .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
-
-            append_cached_assets_to_scan_state(scan, &container.assets);
-            scan.scanned_containers = interim_scanned;
-            scan.total_containers = total_containers;
-            scan.assets.len()
-        };
-
-        if let Some(source) = progress_source {
-            let now = Instant::now();
-            let is_last = index + 1 >= containers.len();
-            if is_last || now.saturating_duration_since(last_progress_emit_at) >= Duration::from_millis(125)
-            {
-                last_progress_emit_at = now;
-                emit_scan_progress(
-                    app,
-                    ScanProgressEvent {
-                        scan_id: scan_id.to_string(),
-                        scanned_containers: interim_scanned,
-                        total_containers,
-                        asset_count,
-                        phase: ScanPhase::Scanning,
-                        current_source: Some(source.to_string()),
-                    },
-                );
-            }
-        }
-    }
-
-    let final_asset_count = {
-        let state = app.state::<AppState>();
-        let mut scans = state
-            .scans
-            .lock()
-            .map_err(|_| "Failed to lock scans state".to_string())?;
-
-        let scan = scans
-            .get_mut(scan_id)
-            .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
-        scan.scanned_containers = scanned_containers;
-        scan.total_containers = total_containers;
-        scan.assets.len()
-    };
-
-    if let Some(source) = progress_source {
-        emit_scan_progress(
-            app,
-            ScanProgressEvent {
-                scan_id: scan_id.to_string(),
-                scanned_containers,
-                total_containers,
-                asset_count: final_asset_count,
-                phase: ScanPhase::Scanning,
-                current_source: Some(source.to_string()),
-            },
-        );
-    }
-
-    Ok(())
-}
-
-fn append_cached_assets_to_scan_state(scan: &mut ScanState, assets: &[CachedAssetRecord]) {
-    for cached in assets {
-        let asset: AssetRecord = cached.clone().into();
-        if scan.asset_index.contains_key(&asset.asset_id) {
-            continue;
-        }
-
-        let index = scan.assets.len();
-        scan.asset_index.insert(asset.asset_id.clone(), index);
-        scan.search_records.push(build_search_record(&asset));
-        add_asset_to_tree(&mut scan.tree_children, &asset);
-        scan.assets.push(asset);
-    }
 }
 
 #[cfg(test)]
@@ -1562,23 +1162,7 @@ fn rebuild_key_counts_from_assets(assets: &[AssetRecord]) -> HashMap<String, usi
     counts
 }
 
-fn rebuild_key_counts_from_cached_containers(
-    containers: &[CachedContainer],
-) -> HashMap<String, usize> {
-    let mut counts = HashMap::<String, usize>::new();
-
-    for container in containers {
-        for asset in &container.assets {
-            let (base_key, suffix) = parse_dup_suffix(&asset.key);
-            let required = suffix.map(|index| index + 1).unwrap_or(1);
-            let current = counts.entry(base_key).or_insert(0);
-            *current = (*current).max(required);
-        }
-    }
-
-    counts
-}
-
+#[cfg(test)]
 fn parse_dup_suffix(key: &str) -> (String, Option<usize>) {
     if let Some((base, suffix)) = key.rsplit_once(".dup") {
         if !base.is_empty() && !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
@@ -1589,133 +1173,6 @@ fn parse_dup_suffix(key: &str) -> (String, Option<usize>) {
     }
 
     (key.to_string(), None)
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn resolve_scan_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_cache_dir()
-        .map_err(|error| format!("Failed to resolve app cache directory: {error}"))?
-        .join(SCAN_CACHE_FILE_NAME))
-}
-
-fn load_scan_cache_store(app: &AppHandle) -> Result<ScanCacheStore, String> {
-    let path = resolve_scan_cache_path(app)?;
-    if !path.is_file() {
-        return Ok(ScanCacheStore::default());
-    }
-
-    let content = fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read scan cache {}: {error}", path.display()))?;
-    let parsed: ScanCacheStore = serde_json::from_str(&content)
-        .map_err(|error| format!("Failed to parse scan cache {}: {error}", path.display()))?;
-
-    if parsed.schema_version != SCAN_CACHE_SCHEMA_VERSION {
-        return Ok(ScanCacheStore::default());
-    }
-
-    Ok(parsed)
-}
-
-fn save_scan_cache_store(app: &AppHandle, store: &ScanCacheStore) -> Result<(), String> {
-    let path = resolve_scan_cache_path(app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create scan cache directory: {error}"))?;
-    }
-
-    let serialized =
-        serde_json::to_string(store).map_err(|error| format!("Failed to encode scan cache: {error}"))?;
-    fs::write(&path, serialized)
-        .map_err(|error| format!("Failed to write scan cache {}: {error}", path.display()))
-}
-
-fn persist_scan_cache_entry(
-    store: &mut ScanCacheStore,
-    profile_key: String,
-    containers: Vec<CachedContainer>,
-    existing_created_at: Option<u64>,
-) {
-    let now = now_unix_ms();
-    let created_at = existing_created_at.unwrap_or(now);
-
-    if let Some(entry) = store
-        .entries
-        .iter_mut()
-        .find(|entry| entry.profile_key == profile_key)
-    {
-        entry.last_used_at_unix_ms = now;
-        entry.created_at_unix_ms = created_at;
-        entry.containers = containers;
-    } else {
-        store.entries.push(ScanCacheEntry {
-            profile_key,
-            created_at_unix_ms: created_at,
-            last_used_at_unix_ms: now,
-            containers,
-        });
-    }
-
-    prune_scan_cache_entries(store, now);
-}
-
-fn persist_scan_cache_entry_async(
-    app: &AppHandle,
-    mut store: ScanCacheStore,
-    profile_key: String,
-    containers: Vec<CachedContainer>,
-    existing_created_at: Option<u64>,
-) {
-    persist_scan_cache_entry(
-        &mut store,
-        profile_key,
-        containers,
-        existing_created_at,
-    );
-    let app = app.clone();
-    thread::spawn(move || {
-        let _ = save_scan_cache_store(&app, &store);
-    });
-}
-
-fn prune_scan_cache_entries(store: &mut ScanCacheStore, now_unix_ms: u64) {
-    let ttl_ms = SCAN_CACHE_MAX_AGE_SECONDS * 1000;
-    store.entries.retain(|entry| {
-        now_unix_ms.saturating_sub(entry.last_used_at_unix_ms) <= ttl_ms
-    });
-
-    store
-        .entries
-        .sort_by(|left, right| right.last_used_at_unix_ms.cmp(&left.last_used_at_unix_ms));
-    if store.entries.len() > SCAN_CACHE_MAX_ENTRIES {
-        store.entries.truncate(SCAN_CACHE_MAX_ENTRIES);
-    }
-}
-
-fn build_scan_profile_key(
-    prism_root: &Path,
-    instance_dir: &Path,
-    mc_version: &str,
-    include_vanilla: bool,
-    include_mods: bool,
-    include_resourcepacks: bool,
-) -> String {
-    format!(
-        "prism={}::instance={}::mc={}::sources={}{}{}",
-        prism_root.to_string_lossy(),
-        instance_dir.to_string_lossy(),
-        mc_version,
-        if include_vanilla { "v" } else { "-" },
-        if include_mods { "m" } else { "-" },
-        if include_resourcepacks { "r" } else { "-" }
-    )
 }
 
 fn append_assets_chunk(
@@ -1973,209 +1430,6 @@ fn collect_scan_containers(
     }
 
     Ok(containers)
-}
-
-fn resolve_scan_containers(
-    app: &AppHandle,
-    scan_id: &str,
-    containers: Vec<ScanContainer>,
-    emit_progress: bool,
-) -> Result<Vec<ResolvedScanContainer>, String> {
-    if containers.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    enum FingerprintWorkerResult {
-        Resolved {
-            index: usize,
-            resolved: ResolvedScanContainer,
-        },
-        Error(String),
-    }
-
-    let total = containers.len();
-    let workers = thread::available_parallelism()
-        .map(|value| value.get().saturating_sub(2))
-        .unwrap_or(1)
-        .clamp(1, MAX_SCAN_FINGERPRINT_WORKERS)
-        .min(total);
-
-    let (sender, receiver) = mpsc::channel::<FingerprintWorkerResult>();
-    let next_index = Arc::new(AtomicUsize::new(0));
-    let containers = Arc::new(containers);
-
-    for _ in 0..workers {
-        let sender = sender.clone();
-        let next_index = Arc::clone(&next_index);
-        let containers = Arc::clone(&containers);
-
-        thread::spawn(move || loop {
-            let index = next_index.fetch_add(1, AtomicOrdering::Relaxed);
-            if index >= containers.len() {
-                break;
-            }
-
-            let container = containers[index].clone();
-            let container_id = scan_container_id(&container);
-
-            match fingerprint_container(&container) {
-                Ok(fingerprint) => {
-                    let resolved = ResolvedScanContainer {
-                        container,
-                        container_id,
-                        fingerprint,
-                    };
-                    if sender
-                        .send(FingerprintWorkerResult::Resolved { index, resolved })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    let _ = sender.send(FingerprintWorkerResult::Error(error));
-                    break;
-                }
-            }
-        });
-    }
-
-    drop(sender);
-
-    let mut processed = 0usize;
-    let mut resolved = vec![None; total];
-
-    while processed < total {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(FingerprintWorkerResult::Resolved {
-                index,
-                resolved: item,
-            }) => {
-                processed += 1;
-                let source = item.container.source_name.clone();
-                resolved[index] = Some(item);
-
-                if emit_progress {
-                    emit_scan_progress(
-                        app,
-                        ScanProgressEvent {
-                            scan_id: scan_id.to_string(),
-                            scanned_containers: processed,
-                            total_containers: total,
-                            asset_count: 0,
-                            phase: ScanPhase::Fingerprinting,
-                            current_source: Some(source),
-                        },
-                    );
-                }
-            }
-            Ok(FingerprintWorkerResult::Error(error)) => return Err(error),
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    if processed < total {
-        return Err("Fingerprint workers disconnected before processing all containers".to_string());
-    }
-
-    resolved
-        .into_iter()
-        .enumerate()
-        .map(|(index, item)| {
-            item.ok_or_else(|| format!("Missing fingerprint result for container index {index}"))
-        })
-        .collect()
-}
-
-fn scan_container_id(container: &ScanContainer) -> String {
-    format!(
-        "{:?}::{:?}::{}::{}",
-        container.source_type,
-        container.container_type,
-        container.source_name,
-        container.container_path.to_string_lossy()
-    )
-}
-
-fn fingerprint_container(container: &ScanContainer) -> Result<ContainerFingerprint, String> {
-    match container.container_type {
-        AssetContainerType::Directory => fingerprint_assets_directory(&container.container_path),
-        AssetContainerType::Zip | AssetContainerType::Jar | AssetContainerType::AssetIndex => {
-            fingerprint_archive_like(&container.container_path)
-        }
-    }
-}
-
-fn fingerprint_archive_like(path: &Path) -> Result<ContainerFingerprint, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("Failed to stat asset container {}: {error}", path.display()))?;
-    Ok(ContainerFingerprint::ArchiveLike {
-        path: path.to_string_lossy().to_string(),
-        size: metadata.len(),
-        mtime_unix_ms: file_mtime_unix_ms(&metadata),
-    })
-}
-
-fn fingerprint_assets_directory(path: &Path) -> Result<ContainerFingerprint, String> {
-    let assets_root = path.join("assets");
-    let mut file_count = 0u64;
-    let mut total_size = 0u64;
-    let mut latest_mtime_unix_ms = 0u64;
-    let mut rolling_hash = 0u64;
-
-    if assets_root.is_dir() {
-        for entry in WalkDir::new(&assets_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let metadata = match entry.metadata() {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-
-            let Ok(relative) = entry.path().strip_prefix(path) else {
-                continue;
-            };
-
-            let rel_path = normalize_archive_path(relative);
-            let size = metadata.len();
-            let mtime_unix_ms = file_mtime_unix_ms(&metadata);
-
-            file_count = file_count.saturating_add(1);
-            total_size = total_size.saturating_add(size);
-            latest_mtime_unix_ms = latest_mtime_unix_ms.max(mtime_unix_ms);
-
-            let mut hasher = DefaultHasher::new();
-            rel_path.hash(&mut hasher);
-            size.hash(&mut hasher);
-            mtime_unix_ms.hash(&mut hasher);
-            let entry_hash = hasher.finish();
-            rolling_hash = rolling_hash.wrapping_add(entry_hash ^ 0x9e37_79b9_7f4a_7c15);
-        }
-    }
-
-    Ok(ContainerFingerprint::AssetsDir {
-        path: path.to_string_lossy().to_string(),
-        file_count,
-        total_size,
-        latest_mtime_unix_ms,
-        rolling_hash,
-    })
-}
-
-fn file_mtime_unix_ms(metadata: &fs::Metadata) -> u64 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn scan_container(container: &ScanContainer) -> Result<Vec<AssetCandidate>, String> {
@@ -2743,7 +1997,12 @@ fn idle_asset_cmp(left: &AssetRecord, right: &AssetRecord) -> CmpOrdering {
     let right_token = last_filename_token(&right_name);
 
     natural_compare(&left_token, &right_token)
-        .then_with(|| natural_compare(&left_name.to_ascii_lowercase(), &right_name.to_ascii_lowercase()))
+        .then_with(|| {
+            natural_compare(
+                &left_name.to_ascii_lowercase(),
+                &right_name.to_ascii_lowercase(),
+            )
+        })
         .then_with(|| left.key.cmp(&right.key))
 }
 
@@ -2811,7 +2070,9 @@ fn natural_chunks(value: &str) -> Vec<NaturalChunk> {
             current.push(ch);
         } else {
             if is_number && !current.is_empty() {
-                chunks.push(NaturalChunk::Number(current.parse::<u64>().unwrap_or(u64::MAX)));
+                chunks.push(NaturalChunk::Number(
+                    current.parse::<u64>().unwrap_or(u64::MAX),
+                ));
                 current.clear();
             }
             is_number = false;
@@ -2821,7 +2082,9 @@ fn natural_chunks(value: &str) -> Vec<NaturalChunk> {
 
     if !current.is_empty() {
         if is_number {
-            chunks.push(NaturalChunk::Number(current.parse::<u64>().unwrap_or(u64::MAX)));
+            chunks.push(NaturalChunk::Number(
+                current.parse::<u64>().unwrap_or(u64::MAX),
+            ));
         } else {
             chunks.push(NaturalChunk::Text(current.to_ascii_lowercase()));
         }
@@ -3004,7 +2267,10 @@ fn resolve_operation_id(operation_id: Option<String>) -> String {
         .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
-fn register_export_operation(state: &State<'_, AppState>, operation_id: &str) -> Result<(), String> {
+fn register_export_operation(
+    state: &State<'_, AppState>,
+    operation_id: &str,
+) -> Result<(), String> {
     let mut operations = state
         .export_operations
         .lock()
@@ -3073,8 +2339,14 @@ struct ExportRunOutcome {
 
 #[derive(Debug)]
 enum ExportWorkerResult {
-    Success { index: usize, output_path: PathBuf },
-    Failure { index: usize, failure: ExportFailure },
+    Success {
+        index: usize,
+        output_path: PathBuf,
+    },
+    Failure {
+        index: usize,
+        failure: ExportFailure,
+    },
 }
 
 fn plan_export_jobs(
@@ -3100,7 +2372,8 @@ fn plan_export_jobs(
             }
         }
 
-        let target_name = dedupe_file_name(&base_stem, &extension, destination_dir, &mut used_names);
+        let target_name =
+            dedupe_file_name(&base_stem, &extension, destination_dir, &mut used_names);
         jobs.push(ExportJob {
             index,
             asset,
@@ -3158,8 +2431,8 @@ fn run_export_operation(
         });
     }
 
-    let should_convert_audio = audio_format != AudioFormat::Original
-        && jobs.iter().any(|job| job.asset.is_audio);
+    let should_convert_audio =
+        audio_format != AudioFormat::Original && jobs.iter().any(|job| job.asset.is_audio);
     let ffmpeg_path = if should_convert_audio {
         Some(resolve_ffmpeg_path(app)?)
     } else {
@@ -3532,7 +2805,7 @@ fn extract_asset_bytes_with_archive_cache(
                 .map_err(|error| format!("Failed to read file {}: {error}", file_path.display()))
         }
         AssetContainerType::AssetIndex => Err(
-                "AssetIndex container type is metadata-only and cannot be extracted directly"
+            "AssetIndex container type is metadata-only and cannot be extracted directly"
                 .to_string(),
         ),
         AssetContainerType::Zip | AssetContainerType::Jar => {
@@ -3998,65 +3271,6 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_assets_dir_ignores_non_assets_files() {
-        let temp_root = std::env::temp_dir().join(format!("mae-fingerprint-{}", Uuid::new_v4()));
-        let assets_file = temp_root.join("assets/example/textures/item/active1.png");
-        let saves_file = temp_root.join("saves/world1/level.dat");
-
-        fs::create_dir_all(
-            assets_file
-                .parent()
-                .expect("assets parent must be available"),
-        )
-        .expect("must create assets directory");
-        fs::create_dir_all(
-            saves_file
-                .parent()
-                .expect("saves parent must be available"),
-        )
-        .expect("must create saves directory");
-
-        fs::write(&assets_file, b"texture").expect("must write asset");
-        fs::write(&saves_file, b"world-data").expect("must write world data");
-
-        let first = fingerprint_assets_directory(&temp_root).expect("must fingerprint");
-        fs::write(&saves_file, b"changed-world-data").expect("must update world data");
-        let second = fingerprint_assets_directory(&temp_root).expect("must fingerprint");
-
-        assert_eq!(first, second);
-        let _ = fs::remove_dir_all(&temp_root);
-    }
-
-    #[test]
-    fn prune_cache_respects_ttl_and_max_entries() {
-        let now = 10_000_000u64;
-        let mut entries = Vec::new();
-        for index in 0..25 {
-            entries.push(ScanCacheEntry {
-                profile_key: format!("profile-{index}"),
-                created_at_unix_ms: now.saturating_sub((index as u64) * 1_000),
-                last_used_at_unix_ms: now.saturating_sub((index as u64) * 1_000),
-                containers: Vec::new(),
-            });
-        }
-        entries.push(ScanCacheEntry {
-            profile_key: "expired".to_string(),
-            created_at_unix_ms: 1,
-            last_used_at_unix_ms: now.saturating_sub((SCAN_CACHE_MAX_AGE_SECONDS * 1000) + 1),
-            containers: Vec::new(),
-        });
-
-        let mut store = ScanCacheStore {
-            schema_version: SCAN_CACHE_SCHEMA_VERSION,
-            entries,
-        };
-        prune_scan_cache_entries(&mut store, now);
-
-        assert_eq!(store.entries.len(), SCAN_CACHE_MAX_ENTRIES);
-        assert!(!store.entries.iter().any(|entry| entry.profile_key == "expired"));
-    }
-
-    #[test]
     fn idle_sort_uses_natural_last_filename_token() {
         let a1 = sample_asset(
             "mod.sample.sample.sounds.entity.test.active1.ogg",
@@ -4157,7 +3371,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["step.mp3".to_string(), "step_1.mp3".to_string()]);
+        assert_eq!(
+            names,
+            vec!["step.mp3".to_string(), "step_1.mp3".to_string()]
+        );
         let _ = fs::remove_dir_all(&temp_root);
     }
 
