@@ -14,7 +14,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use strsim::damerau_levenshtein;
 use tauri::{
@@ -28,6 +28,8 @@ use zip::ZipArchive;
 const ROOT_NODE_ID: &str = "root";
 const MAX_SCAN_WORKERS: usize = 6;
 const MAX_EXPORT_WORKERS: usize = 16;
+const SCAN_CACHE_SCHEMA_VERSION: u32 = 1;
+const SCAN_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Default)]
 struct AppState {
@@ -50,6 +52,7 @@ impl ExportOperationState {
 #[derive(Debug, Clone)]
 struct ScanState {
     status: ScanLifecycle,
+    is_refreshing: bool,
     scanned_containers: usize,
     total_containers: usize,
     error: Option<String>,
@@ -58,6 +61,10 @@ struct ScanState {
     asset_index: HashMap<String, usize>,
     search_records: Vec<AssetSearchRecord>,
     tree_children: HashMap<String, Vec<TreeNode>>,
+    container_assets: HashMap<String, Vec<AssetRecord>>,
+    container_signatures: HashMap<String, ContainerSignature>,
+    id_aliases: HashMap<String, String>,
+    cache_key: Option<String>,
     last_progress_emit_at: Option<Instant>,
 }
 
@@ -68,6 +75,7 @@ impl ScanState {
 
         Self {
             status: ScanLifecycle::Scanning,
+            is_refreshing: false,
             scanned_containers: 0,
             total_containers: 0,
             error: None,
@@ -76,6 +84,10 @@ impl ScanState {
             asset_index: HashMap::new(),
             search_records: Vec::new(),
             tree_children,
+            container_assets: HashMap::new(),
+            container_signatures: HashMap::new(),
+            id_aliases: HashMap::new(),
+            cache_key: None,
             last_progress_emit_at: None,
         }
     }
@@ -84,6 +96,7 @@ impl ScanState {
         ScanStatus {
             scan_id: scan_id.to_string(),
             lifecycle: self.status.clone(),
+            is_refreshing: self.is_refreshing,
             scanned_containers: self.scanned_containers,
             total_containers: self.total_containers,
             asset_count: self.assets.len(),
@@ -92,7 +105,7 @@ impl ScanState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AssetSearchRecord {
     all_tokens: Vec<String>,
     filename_tokens: Vec<String>,
@@ -150,7 +163,7 @@ impl AssetSourceType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 enum AssetContainerType {
     Directory,
@@ -176,7 +189,7 @@ struct AssetRecord {
     entry_path: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TreeNode {
     id: String,
@@ -186,7 +199,7 @@ struct TreeNode {
     asset_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum TreeNodeType {
     Folder,
@@ -201,12 +214,16 @@ struct StartScanRequest {
     include_vanilla: bool,
     include_mods: bool,
     include_resourcepacks: bool,
+    force_rescan: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StartScanResponse {
     scan_id: String,
+    cache_hit: bool,
+    refresh_started: bool,
+    refresh_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -214,6 +231,7 @@ struct StartScanResponse {
 struct ScanStatus {
     scan_id: String,
     lifecycle: ScanLifecycle,
+    is_refreshing: bool,
     scanned_containers: usize,
     total_containers: usize,
     asset_count: usize,
@@ -234,6 +252,7 @@ enum ScanLifecycle {
 enum ScanPhase {
     Estimating,
     Scanning,
+    Refreshing,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -398,6 +417,20 @@ struct ConvertedTempFileRef {
     format: AudioFormat,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileAssetIdsRequest {
+    scan_id: String,
+    asset_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileAssetIdsResponse {
+    id_map: HashMap<String, String>,
+    asset_ids: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct MmcPack {
     components: Vec<MmcComponent>,
@@ -451,6 +484,69 @@ struct AssetCandidate {
     extension: String,
     is_image: bool,
     is_audio: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ContainerSignature {
+    kind: AssetContainerType,
+    path: String,
+    mtime_ms: u64,
+    size: u64,
+    file_count: u64,
+    newest_mtime_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanSnapshot {
+    schema_version: u32,
+    cache_key: String,
+    prism_root: String,
+    instance_folder: String,
+    include_vanilla: bool,
+    include_mods: bool,
+    include_resourcepacks: bool,
+    created_at: u64,
+    last_used_at: u64,
+    app_version: String,
+    assets: Vec<AssetRecord>,
+    search_records: Vec<AssetSearchRecord>,
+    tree_children: HashMap<String, Vec<TreeNode>>,
+    container_assets: HashMap<String, Vec<AssetRecord>>,
+    container_signatures: HashMap<String, ContainerSignature>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanCacheManifest {
+    schema_version: u32,
+    entries: HashMap<String, ScanCacheManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanCacheManifestEntry {
+    file_name: String,
+    size_bytes: u64,
+    last_accessed_at: u64,
+}
+
+impl Default for ScanCacheManifest {
+    fn default() -> Self {
+        Self {
+            schema_version: SCAN_CACHE_SCHEMA_VERSION,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ScanRefreshPlan {
+    unchanged_keys: Vec<String>,
+    changed_or_new: Vec<ScanContainer>,
+    removed_keys: Vec<String>,
+    signatures_by_key: HashMap<String, ContainerSignature>,
 }
 
 #[tauri::command]
@@ -539,6 +635,361 @@ fn list_instances(prism_root: String) -> Result<Vec<InstanceInfo>, String> {
     Ok(instances)
 }
 
+fn unix_timestamp_ms() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(u128::from(u64::MAX)) as u64,
+        Err(_) => 0,
+    }
+}
+
+fn file_mtime_ms(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn scan_container_key(container: &ScanContainer) -> String {
+    format!(
+        "{}::{}::{}::{}",
+        container.source_type.key_prefix(),
+        container.source_name,
+        container_type_key(&container.container_type),
+        container.container_path.to_string_lossy()
+    )
+}
+
+fn container_type_key(container_type: &AssetContainerType) -> &'static str {
+    match container_type {
+        AssetContainerType::Directory => "directory",
+        AssetContainerType::Zip => "zip",
+        AssetContainerType::Jar => "jar",
+        AssetContainerType::AssetIndex => "asset_index",
+    }
+}
+
+fn scan_cache_key_for_request(req: &StartScanRequest) -> String {
+    let prism_root = expand_home(&req.prism_root);
+    let prism_root = prism_root.to_string_lossy();
+    format!(
+        "{}::{}::{}{}{}",
+        prism_root,
+        req.instance_folder.trim(),
+        if req.include_vanilla { 'v' } else { '-' },
+        if req.include_mods { 'm' } else { '-' },
+        if req.include_resourcepacks { 'r' } else { '-' },
+    )
+}
+
+fn fnv1a64(value: &str) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+fn scan_cache_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?
+        .join("scan-cache")
+        .join("v1");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("Failed to create scan cache directory: {error}"))?;
+    Ok(root)
+}
+
+fn scan_cache_manifest_path(cache_root: &Path) -> PathBuf {
+    cache_root.join("manifest.json")
+}
+
+fn scan_cache_snapshot_file_name(cache_key: &str) -> String {
+    format!("{:016x}.json", fnv1a64(cache_key))
+}
+
+fn scan_cache_snapshot_path(cache_root: &Path, cache_key: &str) -> PathBuf {
+    cache_root.join(scan_cache_snapshot_file_name(cache_key))
+}
+
+fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let temp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| format!("Failed to serialize {}: {error}", path.display()))?;
+    fs::write(&temp_path, bytes)
+        .map_err(|error| format!("Failed to write {}: {error}", temp_path.display()))?;
+    fs::rename(&temp_path, path)
+        .map_err(|error| format!("Failed to replace {}: {error}", path.display()))?;
+    Ok(())
+}
+
+fn load_scan_cache_manifest(cache_root: &Path) -> Result<ScanCacheManifest, String> {
+    let manifest_path = scan_cache_manifest_path(cache_root);
+    if !manifest_path.is_file() {
+        return Ok(ScanCacheManifest::default());
+    }
+
+    let data = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("Failed to read cache manifest: {error}"))?;
+    let parsed: ScanCacheManifest = serde_json::from_str(&data)
+        .map_err(|error| format!("Failed to parse cache manifest: {error}"))?;
+    if parsed.schema_version != SCAN_CACHE_SCHEMA_VERSION {
+        return Ok(ScanCacheManifest::default());
+    }
+    Ok(parsed)
+}
+
+fn save_scan_cache_manifest(cache_root: &Path, manifest: &ScanCacheManifest) -> Result<(), String> {
+    write_json_atomically(&scan_cache_manifest_path(cache_root), manifest)
+}
+
+fn remove_cache_entry(cache_root: &Path, manifest: &mut ScanCacheManifest, cache_key: &str) {
+    let file_name = scan_cache_snapshot_file_name(cache_key);
+    let path = cache_root.join(&file_name);
+    let _ = fs::remove_file(path);
+    manifest.entries.remove(cache_key);
+}
+
+fn prune_scan_cache(cache_root: &Path, manifest: &mut ScanCacheManifest) {
+    let mut total_size = manifest
+        .entries
+        .values()
+        .map(|entry| entry.size_bytes)
+        .sum::<u64>();
+    if total_size <= SCAN_CACHE_MAX_BYTES {
+        return;
+    }
+
+    let mut eviction_order = manifest
+        .entries
+        .iter()
+        .map(|(cache_key, entry)| (cache_key.clone(), entry.last_accessed_at))
+        .collect::<Vec<_>>();
+    eviction_order.sort_by(|left, right| left.1.cmp(&right.1));
+
+    for (cache_key, _) in eviction_order {
+        let Some(entry) = manifest.entries.remove(&cache_key) else {
+            continue;
+        };
+        let path = cache_root.join(&entry.file_name);
+        let _ = fs::remove_file(path);
+        total_size = total_size.saturating_sub(entry.size_bytes);
+        if total_size <= SCAN_CACHE_MAX_BYTES {
+            break;
+        }
+    }
+}
+
+fn load_cached_snapshot(
+    app: &AppHandle,
+    cache_key: &str,
+) -> Result<Option<(ScanSnapshot, ScanCacheManifest)>, String> {
+    let cache_root = scan_cache_root(app)?;
+    let mut manifest = load_scan_cache_manifest(&cache_root)?;
+    let snapshot_path = scan_cache_snapshot_path(&cache_root, cache_key);
+    if !snapshot_path.is_file() {
+        manifest.entries.remove(cache_key);
+        let _ = save_scan_cache_manifest(&cache_root, &manifest);
+        return Ok(None);
+    }
+
+    let data = match fs::read_to_string(&snapshot_path) {
+        Ok(value) => value,
+        Err(_) => {
+            remove_cache_entry(&cache_root, &mut manifest, cache_key);
+            let _ = save_scan_cache_manifest(&cache_root, &manifest);
+            return Ok(None);
+        }
+    };
+    let parsed: ScanSnapshot = match serde_json::from_str(&data) {
+        Ok(value) => value,
+        Err(_) => {
+            remove_cache_entry(&cache_root, &mut manifest, cache_key);
+            let _ = save_scan_cache_manifest(&cache_root, &manifest);
+            return Ok(None);
+        }
+    };
+    if parsed.schema_version != SCAN_CACHE_SCHEMA_VERSION {
+        remove_cache_entry(&cache_root, &mut manifest, cache_key);
+        let _ = save_scan_cache_manifest(&cache_root, &manifest);
+        return Ok(None);
+    }
+
+    let now = unix_timestamp_ms();
+    let entry = manifest
+        .entries
+        .entry(cache_key.to_string())
+        .or_insert(ScanCacheManifestEntry {
+            file_name: scan_cache_snapshot_file_name(cache_key),
+            size_bytes: fs::metadata(&snapshot_path).map(|meta| meta.len()).unwrap_or(0),
+            last_accessed_at: now,
+        });
+    entry.last_accessed_at = now;
+    let _ = save_scan_cache_manifest(&cache_root, &manifest);
+    Ok(Some((parsed, manifest)))
+}
+
+fn save_snapshot_to_cache(app: &AppHandle, snapshot: &ScanSnapshot) -> Result<(), String> {
+    let cache_root = scan_cache_root(app)?;
+    let mut manifest = load_scan_cache_manifest(&cache_root)?;
+    let snapshot_path = scan_cache_snapshot_path(&cache_root, &snapshot.cache_key);
+    write_json_atomically(&snapshot_path, snapshot)?;
+    let size_bytes = fs::metadata(&snapshot_path)
+        .map(|meta| meta.len())
+        .map_err(|error| format!("Failed to stat cache snapshot {}: {error}", snapshot_path.display()))?;
+    manifest.entries.insert(
+        snapshot.cache_key.clone(),
+        ScanCacheManifestEntry {
+            file_name: scan_cache_snapshot_file_name(&snapshot.cache_key),
+            size_bytes,
+            last_accessed_at: unix_timestamp_ms(),
+        },
+    );
+    prune_scan_cache(&cache_root, &mut manifest);
+    save_scan_cache_manifest(&cache_root, &manifest)
+}
+
+fn container_signature_for_path(
+    container_path: &Path,
+    container_type: &AssetContainerType,
+) -> Result<ContainerSignature, String> {
+    let metadata = fs::metadata(container_path)
+        .map_err(|error| format!("Failed to read metadata {}: {error}", container_path.display()))?;
+    let mut file_count = 0u64;
+    let mut total_size: u64;
+    let mut newest_mtime_ms: u64;
+
+    if matches!(container_type, AssetContainerType::Directory) {
+        total_size = 0;
+        file_count = 0;
+        newest_mtime_ms = 0;
+        for entry in WalkDir::new(container_path)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                file_count = file_count.saturating_add(1);
+                total_size = total_size.saturating_add(meta.len());
+                newest_mtime_ms = newest_mtime_ms.max(file_mtime_ms(&meta));
+            }
+        }
+    } else {
+        total_size = metadata.len();
+        newest_mtime_ms = file_mtime_ms(&metadata);
+    }
+
+    Ok(ContainerSignature {
+        kind: container_type.clone(),
+        path: container_path.to_string_lossy().to_string(),
+        mtime_ms: file_mtime_ms(&metadata),
+        size: total_size,
+        file_count,
+        newest_mtime_ms,
+    })
+}
+
+fn build_scan_refresh_plan(
+    cached_signatures: &HashMap<String, ContainerSignature>,
+    current_containers: &[ScanContainer],
+) -> Result<ScanRefreshPlan, String> {
+    let mut unchanged_keys = Vec::new();
+    let mut changed_or_new = Vec::new();
+    let mut signatures_by_key = HashMap::new();
+
+    for container in current_containers {
+        let key = scan_container_key(container);
+        let signature = container_signature_for_path(&container.container_path, &container.container_type)?;
+        let is_unchanged = cached_signatures
+            .get(&key)
+            .map(|cached| cached == &signature)
+            .unwrap_or(false);
+        if is_unchanged {
+            unchanged_keys.push(key.clone());
+        } else {
+            changed_or_new.push(container.clone());
+        }
+        signatures_by_key.insert(key, signature);
+    }
+
+    let mut removed_keys = cached_signatures
+        .keys()
+        .filter(|key| !signatures_by_key.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    removed_keys.sort();
+    unchanged_keys.sort();
+    changed_or_new.sort_by(|left, right| scan_container_key(left).cmp(&scan_container_key(right)));
+
+    Ok(ScanRefreshPlan {
+        unchanged_keys,
+        changed_or_new,
+        removed_keys,
+        signatures_by_key,
+    })
+}
+
+fn asset_identity(asset: &AssetRecord) -> String {
+    format!(
+        "{}::{}::{}::{}::{}::{}",
+        asset.source_type.key_prefix(),
+        asset.source_name,
+        asset.namespace,
+        asset.relative_asset_path,
+        asset.container_path,
+        asset.entry_path
+    )
+}
+
+fn build_asset_reconciliation_map(
+    previous_assets: &[AssetRecord],
+    next_assets: &[AssetRecord],
+) -> HashMap<String, String> {
+    let mut next_by_id = HashSet::new();
+    let mut next_by_identity = HashMap::<String, Vec<String>>::new();
+    for asset in next_assets {
+        next_by_id.insert(asset.asset_id.clone());
+        next_by_identity
+            .entry(asset_identity(asset))
+            .or_default()
+            .push(asset.asset_id.clone());
+    }
+
+    let mut identity_cursor = HashMap::<String, usize>::new();
+    let mut id_map = HashMap::<String, String>::new();
+    for asset in previous_assets {
+        if next_by_id.contains(&asset.asset_id) {
+            id_map.insert(asset.asset_id.clone(), asset.asset_id.clone());
+            continue;
+        }
+
+        let identity = asset_identity(asset);
+        let Some(candidates) = next_by_identity.get(&identity) else {
+            continue;
+        };
+        let cursor = identity_cursor.entry(identity).or_insert(0);
+        let resolved = candidates
+            .get(*cursor)
+            .or_else(|| candidates.last())
+            .cloned();
+        if let Some(mapped_id) = resolved {
+            id_map.insert(asset.asset_id.clone(), mapped_id);
+            *cursor = cursor.saturating_add(1);
+        }
+    }
+
+    id_map
+}
+
 #[tauri::command]
 fn start_scan(
     app: AppHandle,
@@ -546,6 +997,8 @@ fn start_scan(
     req: StartScanRequest,
 ) -> Result<StartScanResponse, String> {
     let scan_id = Uuid::new_v4().to_string();
+    let force_rescan = req.force_rescan.unwrap_or(false);
+    let cache_key = scan_cache_key_for_request(&req);
 
     {
         let mut scans = state
@@ -563,6 +1016,74 @@ fn start_scan(
         }),
     );
 
+    if !force_rescan {
+        if let Some((snapshot, _manifest)) = load_cached_snapshot(&app, &cache_key)? {
+            let cached_asset_count = snapshot.assets.len();
+            {
+                let state = app.state::<AppState>();
+                let mut scans = state
+                    .scans
+                    .lock()
+                    .map_err(|_| "Failed to lock scans state".to_string())?;
+                if let Some(scan) = scans.get_mut(&scan_id) {
+                    scan.status = ScanLifecycle::Completed;
+                    scan.is_refreshing = true;
+                    scan.scanned_containers = snapshot.container_signatures.len();
+                    scan.total_containers = snapshot.container_signatures.len();
+                    scan.error = None;
+                    scan.cancelled = false;
+                    scan.assets = snapshot.assets;
+                    scan.asset_index = scan
+                        .assets
+                        .iter()
+                        .enumerate()
+                        .map(|(index, asset)| (asset.asset_id.clone(), index))
+                        .collect();
+                    scan.search_records = if snapshot.search_records.len() == scan.assets.len() {
+                        snapshot.search_records
+                    } else {
+                        scan.assets.iter().map(build_search_record).collect()
+                    };
+                    scan.tree_children = snapshot.tree_children;
+                    scan.container_assets = snapshot.container_assets;
+                    scan.container_signatures = snapshot.container_signatures;
+                    scan.id_aliases = HashMap::new();
+                    scan.cache_key = Some(cache_key.clone());
+                }
+            }
+
+            let _ = app.emit(
+                "scan://completed",
+                ScanCompletedEvent {
+                    scan_id: scan_id.clone(),
+                    lifecycle: ScanLifecycle::Completed,
+                    asset_count: cached_asset_count,
+                    error: None,
+                },
+            );
+
+            let scan_id_for_worker = scan_id.clone();
+            let app_for_worker = app.clone();
+            let req_for_worker = req.clone();
+            let cache_key_for_worker = cache_key.clone();
+            thread::spawn(move || {
+                run_refresh_worker(
+                    app_for_worker,
+                    scan_id_for_worker,
+                    req_for_worker,
+                    cache_key_for_worker,
+                );
+            });
+
+            return Ok(StartScanResponse {
+                scan_id,
+                cache_hit: true,
+                refresh_started: true,
+                refresh_mode: Some("incremental".to_string()),
+            });
+        }
+    }
+
     emit_scan_progress(
         &app,
         ScanProgressEvent {
@@ -578,10 +1099,15 @@ fn start_scan(
     let scan_id_for_worker = scan_id.clone();
     let app_for_worker = app.clone();
     thread::spawn(move || {
-        run_scan_worker(app_for_worker, scan_id_for_worker, req);
+        run_scan_worker(app_for_worker, scan_id_for_worker, req, cache_key);
     });
 
-    Ok(StartScanResponse { scan_id })
+    Ok(StartScanResponse {
+        scan_id,
+        cache_hit: false,
+        refresh_started: false,
+        refresh_mode: None,
+    })
 }
 
 #[tauri::command]
@@ -610,6 +1136,7 @@ fn cancel_scan(scan_id: String, state: State<'_, AppState>) -> Result<(), String
         .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
 
     scan.cancelled = true;
+    scan.is_refreshing = false;
     scan.status = ScanLifecycle::Cancelled;
     Ok(())
 }
@@ -807,6 +1334,47 @@ fn get_asset_record(
 }
 
 #[tauri::command]
+fn reconcile_asset_ids(
+    req: ReconcileAssetIdsRequest,
+    state: State<'_, AppState>,
+) -> Result<ReconcileAssetIdsResponse, String> {
+    let scans = state
+        .scans
+        .lock()
+        .map_err(|_| "Failed to lock scans state".to_string())?;
+    let scan = scans
+        .get(&req.scan_id)
+        .ok_or_else(|| format!("Unknown scan id: {}", req.scan_id))?;
+
+    let mut id_map = HashMap::<String, String>::new();
+    let mut resolved = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
+
+    for asset_id in req.asset_ids {
+        let mapped = if scan.asset_index.contains_key(&asset_id) {
+            Some(asset_id.clone())
+        } else {
+            scan.id_aliases
+                .get(&asset_id)
+                .filter(|next| scan.asset_index.contains_key(*next))
+                .cloned()
+        };
+
+        if let Some(mapped_id) = mapped {
+            id_map.insert(asset_id, mapped_id.clone());
+            if seen.insert(mapped_id.clone()) {
+                resolved.push(mapped_id);
+            }
+        }
+    }
+
+    Ok(ReconcileAssetIdsResponse {
+        id_map,
+        asset_ids: resolved,
+    })
+}
+
+#[tauri::command]
 fn save_assets(
     app: AppHandle,
     req: SaveAssetsRequest,
@@ -1001,8 +1569,8 @@ fn convert_audio_asset(
     })
 }
 
-fn run_scan_worker(app: AppHandle, scan_id: String, req: StartScanRequest) {
-    let result = run_scan_worker_inner(&app, &scan_id, &req);
+fn run_scan_worker(app: AppHandle, scan_id: String, req: StartScanRequest, cache_key: String) {
+    let result = run_scan_worker_inner(&app, &scan_id, &req, &cache_key);
 
     if let Err(error) = result {
         update_scan_error(&app, &scan_id, &error);
@@ -1020,7 +1588,19 @@ fn run_scan_worker_inner(
     app: &AppHandle,
     scan_id: &str,
     req: &StartScanRequest,
+    cache_key: &str,
 ) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        let lock_result = state.scans.lock();
+        if let Ok(mut scans) = lock_result {
+            if let Some(scan) = scans.get_mut(scan_id) {
+                scan.cache_key = Some(cache_key.to_string());
+                scan.is_refreshing = false;
+            }
+        }
+    }
+
     let prism_root = expand_home(&req.prism_root);
     validate_prism_root(&prism_root)?;
 
@@ -1045,12 +1625,15 @@ fn run_scan_worker_inner(
 
     if total_containers == 0 {
         complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
+        persist_scan_snapshot(app, scan_id, req, cache_key)?;
         return Ok(());
     }
 
     enum ScanWorkerResult {
         Container {
+            container_key: String,
             source_name: String,
+            signature: ContainerSignature,
             candidates: Vec<AssetCandidate>,
         },
         Error(String),
@@ -1085,11 +1668,23 @@ fn run_scan_worker_inner(
             }
 
             let container = &containers[index];
+            let container_key = scan_container_key(container);
+            let signature =
+                match container_signature_for_path(&container.container_path, &container.container_type)
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = sender.send(ScanWorkerResult::Error(error));
+                        break;
+                    }
+                };
             match scan_container(container) {
                 Ok(candidates) => {
                     if sender
                         .send(ScanWorkerResult::Container {
+                            container_key,
                             source_name: container.source_name.clone(),
+                            signature,
                             candidates,
                         })
                         .is_err()
@@ -1118,7 +1713,9 @@ fn run_scan_worker_inner(
 
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(ScanWorkerResult::Container {
+                container_key,
                 source_name,
+                signature,
                 candidates,
             }) => {
                 scanned_containers += 1;
@@ -1126,6 +1723,8 @@ fn run_scan_worker_inner(
                 append_assets_chunk(
                     app,
                     scan_id,
+                    &container_key,
+                    &signature,
                     &assets,
                     scanned_containers,
                     total_containers,
@@ -1144,11 +1743,342 @@ fn run_scan_worker_inner(
     }
 
     complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
+    persist_scan_snapshot(app, scan_id, req, cache_key)?;
 
     Ok(())
 }
 
-#[cfg(test)]
+fn persist_scan_snapshot(
+    app: &AppHandle,
+    scan_id: &str,
+    req: &StartScanRequest,
+    cache_key: &str,
+) -> Result<(), String> {
+    let snapshot = {
+        let state = app.state::<AppState>();
+        let scans = state
+            .scans
+            .lock()
+            .map_err(|_| "Failed to lock scans state".to_string())?;
+        let scan = scans
+            .get(scan_id)
+            .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
+
+        ScanSnapshot {
+            schema_version: SCAN_CACHE_SCHEMA_VERSION,
+            cache_key: cache_key.to_string(),
+            prism_root: req.prism_root.clone(),
+            instance_folder: req.instance_folder.clone(),
+            include_vanilla: req.include_vanilla,
+            include_mods: req.include_mods,
+            include_resourcepacks: req.include_resourcepacks,
+            created_at: unix_timestamp_ms(),
+            last_used_at: unix_timestamp_ms(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            assets: scan.assets.clone(),
+            search_records: scan.search_records.clone(),
+            tree_children: scan.tree_children.clone(),
+            container_assets: scan.container_assets.clone(),
+            container_signatures: scan.container_signatures.clone(),
+        }
+    };
+
+    save_snapshot_to_cache(app, &snapshot)
+}
+
+fn build_scan_indexes(
+    assets: &[AssetRecord],
+) -> (
+    HashMap<String, usize>,
+    Vec<AssetSearchRecord>,
+    HashMap<String, Vec<TreeNode>>,
+) {
+    let mut asset_index = HashMap::<String, usize>::new();
+    let mut search_records = Vec::<AssetSearchRecord>::new();
+    let mut tree_children = HashMap::<String, Vec<TreeNode>>::new();
+    tree_children.insert(ROOT_NODE_ID.to_string(), Vec::new());
+
+    for (index, asset) in assets.iter().enumerate() {
+        asset_index.insert(asset.asset_id.clone(), index);
+        search_records.push(build_search_record(asset));
+        add_asset_to_tree(&mut tree_children, asset);
+    }
+
+    (asset_index, search_records, tree_children)
+}
+
+fn run_refresh_worker(app: AppHandle, scan_id: String, req: StartScanRequest, cache_key: String) {
+    let result = run_refresh_worker_inner(&app, &scan_id, &req, &cache_key);
+    if let Err(error) = result {
+        update_scan_error(&app, &scan_id, &error);
+        let _ = app.emit(
+            "scan://error",
+            serde_json::json!({
+                "scanId": scan_id,
+                "error": error,
+            }),
+        );
+    }
+}
+
+fn run_refresh_worker_inner(
+    app: &AppHandle,
+    scan_id: &str,
+    req: &StartScanRequest,
+    cache_key: &str,
+) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        let mut scans = state
+            .scans
+            .lock()
+            .map_err(|_| "Failed to lock scans state".to_string())?;
+        let scan = scans
+            .get_mut(scan_id)
+            .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
+        if scan.cancelled {
+            scan.is_refreshing = false;
+            return Ok(());
+        }
+        scan.is_refreshing = true;
+        scan.status = ScanLifecycle::Completed;
+        scan.error = None;
+        scan.cache_key = Some(cache_key.to_string());
+    }
+
+    let prism_root = expand_home(&req.prism_root);
+    validate_prism_root(&prism_root)?;
+    let instance_dir = resolve_instance_dir(&prism_root, &req.instance_folder)?;
+    let mc_version = parse_minecraft_version(&instance_dir.join("mmc-pack.json"))
+        .ok_or_else(|| "Failed to resolve Minecraft version from mmc-pack.json".to_string())?;
+    let containers = collect_scan_containers(&prism_root, &instance_dir, &mc_version, req)?;
+
+    let (cached_container_assets, cached_signatures, previous_assets) = {
+        let state = app.state::<AppState>();
+        let scans = state
+            .scans
+            .lock()
+            .map_err(|_| "Failed to lock scans state".to_string())?;
+        let scan = scans
+            .get(scan_id)
+            .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
+        (
+            scan.container_assets.clone(),
+            scan.container_signatures.clone(),
+            scan.assets.clone(),
+        )
+    };
+
+    let plan = build_scan_refresh_plan(&cached_signatures, &containers)?;
+    let mut containers_by_key = HashMap::<String, ScanContainer>::new();
+    for container in &containers {
+        containers_by_key.insert(scan_container_key(container), container.clone());
+    }
+
+    let mut unchanged_keys = Vec::new();
+    let mut changed_containers = plan.changed_or_new;
+    for key in plan.unchanged_keys {
+        if cached_container_assets.contains_key(&key) {
+            unchanged_keys.push(key);
+        } else if let Some(container) = containers_by_key.get(&key) {
+            changed_containers.push(container.clone());
+        }
+    }
+    changed_containers.sort_by(|left, right| scan_container_key(left).cmp(&scan_container_key(right)));
+
+    let mut merged_container_assets = HashMap::<String, Vec<AssetRecord>>::new();
+    let mut unchanged_assets = Vec::<AssetRecord>::new();
+    for key in &unchanged_keys {
+        if let Some(assets) = cached_container_assets.get(key) {
+            unchanged_assets.extend(assets.clone());
+            merged_container_assets.insert(key.clone(), assets.clone());
+        }
+    }
+
+    let changed_total = changed_containers.len();
+    let mut changed_scanned = 0usize;
+    let mut changed_asset_count = 0usize;
+    let mut key_counts = rebuild_key_counts_from_assets(&unchanged_assets);
+
+    if changed_total > 0 {
+        emit_scan_progress(
+            app,
+            ScanProgressEvent {
+                scan_id: scan_id.to_string(),
+                scanned_containers: 0,
+                total_containers: changed_total,
+                asset_count: unchanged_assets.len(),
+                phase: ScanPhase::Refreshing,
+                current_source: None,
+            },
+        );
+    }
+
+    enum RefreshWorkerResult {
+        Container {
+            container_key: String,
+            source_name: String,
+            candidates: Vec<AssetCandidate>,
+        },
+        Error(String),
+    }
+
+    if changed_total > 0 {
+        let workers = thread::available_parallelism()
+            .map(|value| value.get().saturating_sub(2))
+            .unwrap_or(1)
+            .clamp(1, MAX_SCAN_WORKERS)
+            .min(changed_total);
+        let (sender, receiver) = mpsc::channel::<RefreshWorkerResult>();
+        let next_index = Arc::new(AtomicUsize::new(0));
+        let changed_containers = Arc::new(changed_containers);
+        let scan_id_owned = scan_id.to_string();
+
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let next_index = Arc::clone(&next_index);
+            let changed_containers = Arc::clone(&changed_containers);
+            let app = app.clone();
+            let scan_id = scan_id_owned.clone();
+            thread::spawn(move || loop {
+                if is_scan_cancelled(&app, &scan_id).unwrap_or(true) {
+                    break;
+                }
+                let index = next_index.fetch_add(1, AtomicOrdering::Relaxed);
+                if index >= changed_containers.len() {
+                    break;
+                }
+                let container = &changed_containers[index];
+                let container_key = scan_container_key(container);
+                match scan_container(container) {
+                    Ok(candidates) => {
+                        if sender
+                            .send(RefreshWorkerResult::Container {
+                                container_key,
+                                source_name: container.source_name.clone(),
+                                candidates,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(RefreshWorkerResult::Error(error));
+                        break;
+                    }
+                }
+            });
+        }
+
+        drop(sender);
+
+        while changed_scanned < changed_total {
+            if is_scan_cancelled(app, scan_id)? {
+                let state = app.state::<AppState>();
+                if let Ok(mut scans) = state.scans.lock() {
+                    if let Some(scan) = scans.get_mut(scan_id) {
+                        scan.is_refreshing = false;
+                    }
+                }
+                return Ok(());
+            }
+
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(RefreshWorkerResult::Container {
+                    container_key,
+                    source_name,
+                    candidates,
+                }) => {
+                    changed_scanned += 1;
+                    let assets = finalize_assets(candidates, &mut key_counts);
+                    changed_asset_count = changed_asset_count.saturating_add(assets.len());
+                    merged_container_assets.insert(container_key, assets);
+                    emit_scan_progress(
+                        app,
+                        ScanProgressEvent {
+                            scan_id: scan_id.to_string(),
+                            scanned_containers: changed_scanned,
+                            total_containers: changed_total,
+                            asset_count: unchanged_assets.len().saturating_add(changed_asset_count),
+                            phase: ScanPhase::Refreshing,
+                            current_source: Some(source_name),
+                        },
+                    );
+                }
+                Ok(RefreshWorkerResult::Error(error)) => return Err(error),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    let mut merged_signatures = HashMap::<String, ContainerSignature>::new();
+    for (container_key, signature) in plan.signatures_by_key {
+        if merged_container_assets.contains_key(&container_key) {
+            merged_signatures.insert(container_key, signature);
+        }
+    }
+    for removed in plan.removed_keys {
+        merged_container_assets.remove(&removed);
+        merged_signatures.remove(&removed);
+    }
+
+    let mut container_keys = merged_container_assets.keys().cloned().collect::<Vec<_>>();
+    container_keys.sort();
+    let mut next_assets = Vec::<AssetRecord>::new();
+    for container_key in container_keys {
+        if let Some(assets) = merged_container_assets.get(&container_key) {
+            next_assets.extend(assets.clone());
+        }
+    }
+
+    let (asset_index, search_records, tree_children) = build_scan_indexes(&next_assets);
+    let id_aliases = build_asset_reconciliation_map(&previous_assets, &next_assets);
+    let total_containers = merged_signatures.len();
+    let asset_count = next_assets.len();
+
+    {
+        let state = app.state::<AppState>();
+        let mut scans = state
+            .scans
+            .lock()
+            .map_err(|_| "Failed to lock scans state".to_string())?;
+        let scan = scans
+            .get_mut(scan_id)
+            .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
+        if scan.cancelled {
+            scan.is_refreshing = false;
+            return Ok(());
+        }
+        scan.status = ScanLifecycle::Completed;
+        scan.is_refreshing = false;
+        scan.error = None;
+        scan.scanned_containers = total_containers;
+        scan.total_containers = total_containers;
+        scan.assets = next_assets;
+        scan.asset_index = asset_index;
+        scan.search_records = search_records;
+        scan.tree_children = tree_children;
+        scan.container_assets = merged_container_assets;
+        scan.container_signatures = merged_signatures;
+        scan.id_aliases = id_aliases;
+        scan.cache_key = Some(cache_key.to_string());
+    }
+
+    let _ = app.emit(
+        "scan://completed",
+        ScanCompletedEvent {
+            scan_id: scan_id.to_string(),
+            lifecycle: ScanLifecycle::Completed,
+            asset_count,
+            error: None,
+        },
+    );
+    persist_scan_snapshot(app, scan_id, req, cache_key)?;
+    Ok(())
+}
+
 fn rebuild_key_counts_from_assets(assets: &[AssetRecord]) -> HashMap<String, usize> {
     let mut counts = HashMap::<String, usize>::new();
 
@@ -1162,7 +2092,6 @@ fn rebuild_key_counts_from_assets(assets: &[AssetRecord]) -> HashMap<String, usi
     counts
 }
 
-#[cfg(test)]
 fn parse_dup_suffix(key: &str) -> (String, Option<usize>) {
     if let Some((base, suffix)) = key.rsplit_once(".dup") {
         if !base.is_empty() && !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
@@ -1178,6 +2107,8 @@ fn parse_dup_suffix(key: &str) -> (String, Option<usize>) {
 fn append_assets_chunk(
     app: &AppHandle,
     scan_id: &str,
+    container_key: &str,
+    signature: &ContainerSignature,
     chunk: &[AssetRecord],
     scanned_containers: usize,
     total_containers: usize,
@@ -1202,6 +2133,10 @@ fn append_assets_chunk(
 
         scan.scanned_containers = scanned_containers;
         scan.total_containers = total_containers;
+        scan.container_signatures
+            .insert(container_key.to_string(), signature.clone());
+
+        let mut appended_for_container = Vec::<AssetRecord>::new();
 
         for asset in chunk {
             if scan.asset_index.contains_key(&asset.asset_id) {
@@ -1212,8 +2147,11 @@ fn append_assets_chunk(
             scan.asset_index.insert(asset.asset_id.clone(), index);
             scan.search_records.push(build_search_record(asset));
             scan.assets.push(asset.clone());
+            appended_for_container.push(asset.clone());
             add_asset_to_tree(&mut scan.tree_children, asset);
         }
+        scan.container_assets
+            .insert(container_key.to_string(), appended_for_container);
 
         let now = Instant::now();
         let force_emit = scanned_containers >= total_containers;
@@ -1253,6 +2191,7 @@ fn update_scan_error(app: &AppHandle, scan_id: &str, error: &str) {
     if let Ok(mut scans) = lock_result {
         if let Some(scan) = scans.get_mut(scan_id) {
             scan.status = ScanLifecycle::Error;
+            scan.is_refreshing = false;
             scan.error = Some(error.to_string());
         }
     }
@@ -1278,6 +2217,7 @@ fn complete_scan_with_lifecycle(
             .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
 
         scan.status = lifecycle.clone();
+        scan.is_refreshing = false;
         scan.error = error.clone();
         scan.scanned_containers = scan.total_containers;
         asset_count = scan.assets.len();
@@ -1429,6 +2369,7 @@ fn collect_scan_containers(
         }
     }
 
+    containers.sort_by(|left, right| scan_container_key(left).cmp(&scan_container_key(right)));
     Ok(containers)
 }
 
@@ -3083,6 +4024,7 @@ pub fn run() {
             search_assets,
             get_asset_preview,
             get_asset_record,
+            reconcile_asset_ids,
             save_assets,
             copy_assets_to_clipboard,
             convert_audio_asset,
