@@ -4,11 +4,12 @@ use ffmpeg_sidecar::download::{download_ffmpeg_package, ffmpeg_download_url, unp
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     env, fs,
-    io::Read,
+    hash::{Hash, Hasher},
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
         mpsc, Arc, Mutex,
@@ -26,15 +27,29 @@ use walkdir::WalkDir;
 use zip::ZipArchive;
 
 const ROOT_NODE_ID: &str = "root";
-const SCAN_CACHE_SCHEMA_VERSION: u32 = 1;
-const SCAN_CACHE_FILE_NAME: &str = "scan-cache-v1.json";
+const SCAN_CACHE_SCHEMA_VERSION: u32 = 2;
+const SCAN_CACHE_FILE_NAME: &str = "scan-cache-v2.json";
 const SCAN_CACHE_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const SCAN_CACHE_MAX_ENTRIES: usize = 20;
+const MAX_SCAN_FINGERPRINT_WORKERS: usize = 12;
+const MAX_EXPORT_WORKERS: usize = 16;
 
 #[derive(Default)]
 struct AppState {
     scans: Mutex<HashMap<String, ScanState>>,
+    export_operations: Mutex<HashMap<String, ExportOperationState>>,
     temp_paths: Mutex<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Clone)]
+struct ExportOperationState {
+    cancelled: bool,
+}
+
+impl ExportOperationState {
+    fn new() -> Self {
+        Self { cancelled: false }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,16 +95,11 @@ enum ContainerFingerprint {
     },
     AssetsDir {
         path: String,
-        files: Vec<AssetFileFingerprint>,
+        file_count: u64,
+        total_size: u64,
+        latest_mtime_unix_ms: u64,
+        rolling_hash: u64,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct AssetFileFingerprint {
-    rel_path: String,
-    size: u64,
-    mtime_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,20 +347,23 @@ enum ScanLifecycle {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ScanPhase {
+    Estimating,
+    Fingerprinting,
+    Scanning,
+    Caching,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ScanProgressEvent {
     scan_id: String,
     scanned_containers: usize,
     total_containers: usize,
     asset_count: usize,
+    phase: ScanPhase,
     current_source: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScanChunkEvent {
-    scan_id: String,
-    assets: Vec<AssetRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -360,6 +373,13 @@ struct ScanCompletedEvent {
     lifecycle: ScanLifecycle,
     asset_count: usize,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ExportOperationKind {
+    Save,
+    Copy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +431,7 @@ struct SaveAssetsRequest {
     asset_ids: Vec<String>,
     destination_dir: String,
     audio_format: Option<AudioFormat>,
+    operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,17 +440,65 @@ struct CopyAssetsRequest {
     scan_id: String,
     asset_ids: Vec<String>,
     audio_format: Option<AudioFormat>,
+    operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportFailure {
+    asset_id: String,
+    key: String,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportProgressEvent {
+    operation_id: String,
+    kind: ExportOperationKind,
+    requested_count: usize,
+    processed_count: usize,
+    success_count: usize,
+    failed_count: usize,
+    cancelled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportCompletedEvent {
+    operation_id: String,
+    kind: ExportOperationKind,
+    requested_count: usize,
+    processed_count: usize,
+    success_count: usize,
+    failed_count: usize,
+    cancelled: bool,
+    failures: Vec<ExportFailure>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveAssetsResult {
+    operation_id: String,
+    requested_count: usize,
+    processed_count: usize,
+    success_count: usize,
+    failed_count: usize,
+    cancelled: bool,
+    failures: Vec<ExportFailure>,
     saved_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CopyResult {
+    operation_id: String,
+    requested_count: usize,
+    processed_count: usize,
+    success_count: usize,
+    failed_count: usize,
+    cancelled: bool,
+    failures: Vec<ExportFailure>,
     copied_files: Vec<String>,
 }
 
@@ -596,6 +665,7 @@ fn start_scan(
     req: StartScanRequest,
 ) -> Result<StartScanResponse, String> {
     let scan_id = Uuid::new_v4().to_string();
+    let estimated_total_containers = estimate_container_count(&req)?;
 
     {
         let mut scans = state
@@ -604,9 +674,21 @@ fn start_scan(
             .map_err(|_| "Failed to lock scans state".to_string())?;
 
         let mut scan_state = ScanState::new();
-        scan_state.total_containers = estimate_container_count(&req)?;
+        scan_state.total_containers = estimated_total_containers;
         scans.insert(scan_id.clone(), scan_state);
     }
+
+    emit_scan_progress(
+        &app,
+        ScanProgressEvent {
+            scan_id: scan_id.clone(),
+            scanned_containers: 0,
+            total_containers: estimated_total_containers,
+            asset_count: 0,
+            phase: ScanPhase::Estimating,
+            current_source: None,
+        },
+    );
 
     let _ = app.emit(
         "scan://started",
@@ -651,6 +733,21 @@ fn cancel_scan(scan_id: String, state: State<'_, AppState>) -> Result<(), String
 
     scan.cancelled = true;
     scan.status = ScanLifecycle::Cancelled;
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_export(operation_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut operations = state
+        .export_operations
+        .lock()
+        .map_err(|_| "Failed to lock export operations state".to_string())?;
+
+    let operation = operations
+        .get_mut(&operation_id)
+        .ok_or_else(|| format!("Unknown export operation id: {operation_id}"))?;
+
+    operation.cancelled = true;
     Ok(())
 }
 
@@ -835,8 +932,18 @@ fn save_assets(
     req: SaveAssetsRequest,
     state: State<'_, AppState>,
 ) -> Result<SaveAssetsResult, String> {
+    let operation_id = resolve_operation_id(req.operation_id);
+    let requested_count = req.asset_ids.len();
+
     if req.asset_ids.is_empty() {
         return Ok(SaveAssetsResult {
+            operation_id,
+            requested_count,
+            processed_count: 0,
+            success_count: 0,
+            failed_count: 0,
+            cancelled: false,
+            failures: Vec::new(),
             saved_files: Vec::new(),
         });
     }
@@ -846,21 +953,30 @@ fn save_assets(
         .map_err(|error| format!("Failed to create destination directory: {error}"))?;
 
     let requested_assets = collect_assets(&state, &req.scan_id, &req.asset_ids)?;
-    let mut used_names = HashSet::new();
-    let mut saved_files = Vec::new();
+    register_export_operation(&state, &operation_id)?;
 
-    for asset in requested_assets {
-        let path = materialize_asset(
-            &app,
-            &asset,
-            &destination_dir,
-            req.audio_format.clone().unwrap_or(AudioFormat::Original),
-            &mut used_names,
-        )?;
-        saved_files.push(path.to_string_lossy().to_string());
-    }
+    let run_result = run_export_operation(
+        &app,
+        ExportOperationKind::Save,
+        &operation_id,
+        requested_assets,
+        &destination_dir,
+        req.audio_format.unwrap_or(AudioFormat::Original),
+    );
 
-    Ok(SaveAssetsResult { saved_files })
+    unregister_export_operation(&state, &operation_id);
+
+    let outcome = run_result?;
+    Ok(SaveAssetsResult {
+        operation_id,
+        requested_count,
+        processed_count: outcome.processed_count,
+        success_count: outcome.success_count,
+        failed_count: outcome.failed_count,
+        cancelled: outcome.cancelled,
+        failures: outcome.failures,
+        saved_files: outcome.output_files,
+    })
 }
 
 #[tauri::command]
@@ -869,8 +985,18 @@ fn copy_assets_to_clipboard(
     req: CopyAssetsRequest,
     state: State<'_, AppState>,
 ) -> Result<CopyResult, String> {
+    let operation_id = resolve_operation_id(req.operation_id);
+    let requested_count = req.asset_ids.len();
+
     if req.asset_ids.is_empty() {
         return Ok(CopyResult {
+            operation_id,
+            requested_count,
+            processed_count: 0,
+            success_count: 0,
+            failed_count: 0,
+            cancelled: false,
+            failures: Vec::new(),
             copied_files: Vec::new(),
         });
     }
@@ -886,31 +1012,35 @@ fn copy_assets_to_clipboard(
     fs::create_dir_all(&temp_root)
         .map_err(|error| format!("Failed to create temporary copy directory: {error}"))?;
 
-    let mut used_names = HashSet::new();
-    let mut copied_paths = Vec::new();
+    register_export_operation(&state, &operation_id)?;
 
-    for asset in requested_assets {
-        let output_path = materialize_asset(
-            &app,
-            &asset,
-            &temp_root,
-            req.audio_format.clone().unwrap_or(AudioFormat::Original),
-            &mut used_names,
-        )?;
-        copied_paths.push(output_path);
-    }
+    let run_result = run_export_operation(
+        &app,
+        ExportOperationKind::Copy,
+        &operation_id,
+        requested_assets,
+        &temp_root,
+        req.audio_format.unwrap_or(AudioFormat::Original),
+    );
+
+    unregister_export_operation(&state, &operation_id);
+
+    let outcome = run_result?;
+    let copied_paths: Vec<PathBuf> = outcome.output_files.iter().map(PathBuf::from).collect();
 
     let clipboard = ClipboardContext::new()
         .map_err(|error| format!("Failed to open clipboard context: {error}"))?;
 
-    clipboard
-        .set_files(
-            copied_paths
-                .iter()
-                .map(|path| path.to_string_lossy().to_string())
-                .collect(),
-        )
-        .map_err(|error| format!("Failed to copy files to clipboard: {error}"))?;
+    if !copied_paths.is_empty() {
+        clipboard
+            .set_files(
+                copied_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect(),
+            )
+            .map_err(|error| format!("Failed to copy files to clipboard: {error}"))?;
+    }
 
     {
         let mut temp_paths = state
@@ -921,10 +1051,14 @@ fn copy_assets_to_clipboard(
     }
 
     Ok(CopyResult {
-        copied_files: copied_paths
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect(),
+        operation_id,
+        requested_count,
+        processed_count: outcome.processed_count,
+        success_count: outcome.success_count,
+        failed_count: outcome.failed_count,
+        cancelled: outcome.cancelled,
+        failures: outcome.failures,
+        copied_files: outcome.output_files,
     })
 }
 
@@ -953,14 +1087,25 @@ fn convert_audio_asset(
     fs::create_dir_all(&temp_root)
         .map_err(|error| format!("Failed to create temporary conversion directory: {error}"))?;
 
+    let original_name = Path::new(&asset.relative_asset_path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| asset.asset_id.clone());
+    let (base_stem, _) = split_file_name(&original_name);
+    let extension = match req.format {
+        AudioFormat::Original => asset.extension.clone(),
+        AudioFormat::Mp3 => "mp3".to_string(),
+        AudioFormat::Wav => "wav".to_string(),
+    };
+
     let mut used_names = HashSet::new();
-    let output_path = materialize_asset(
-        &app,
-        &asset,
-        &temp_root,
-        req.format.clone(),
-        &mut used_names,
-    )?;
+    let output_name = dedupe_file_name(&base_stem, &extension, &temp_root, &mut used_names);
+    let output_path = temp_root.join(output_name);
+
+    let ffmpeg_path = resolve_ffmpeg_path(&app)?;
+    let mut archive_cache = HashMap::<String, ZipArchive<fs::File>>::new();
+    let bytes = extract_asset_bytes_with_archive_cache(&asset, &mut archive_cache)?;
+    convert_audio_bytes_to_file(&ffmpeg_path, &bytes, &output_path, &req.format)?;
 
     {
         let mut temp_paths = state
@@ -1004,7 +1149,19 @@ fn run_scan_worker_inner(
         .ok_or_else(|| "Failed to resolve Minecraft version from mmc-pack.json".to_string())?;
 
     let containers = collect_scan_containers(&prism_root, &instance_dir, &mc_version, req)?;
-    let resolved_containers = resolve_scan_containers(&containers)?;
+    emit_scan_progress(
+        app,
+        ScanProgressEvent {
+            scan_id: scan_id.to_string(),
+            scanned_containers: 0,
+            total_containers: containers.len(),
+            asset_count: 0,
+            phase: ScanPhase::Fingerprinting,
+            current_source: None,
+        },
+    );
+
+    let resolved_containers = resolve_scan_containers(app, scan_id, containers)?;
     let profile_key = build_scan_profile_key(
         &prism_root,
         &instance_dir,
@@ -1050,6 +1207,18 @@ fn run_scan_worker_inner(
         }
     }
 
+    emit_scan_progress(
+        app,
+        ScanProgressEvent {
+            scan_id: scan_id.to_string(),
+            scanned_containers: unchanged_cache.len(),
+            total_containers,
+            asset_count: preloaded_assets.len(),
+            phase: ScanPhase::Scanning,
+            current_source: Some("cache".to_string()),
+        },
+    );
+
     {
         let state = app.state::<AppState>();
         let mut scans = state
@@ -1065,6 +1234,18 @@ fn run_scan_worker_inner(
     }
 
     if total_containers == 0 {
+        emit_scan_progress(
+            app,
+            ScanProgressEvent {
+                scan_id: scan_id.to_string(),
+                scanned_containers: 0,
+                total_containers: 0,
+                asset_count: 0,
+                phase: ScanPhase::Caching,
+                current_source: Some("cache".to_string()),
+            },
+        );
+
         persist_scan_cache_entry(
             app,
             &mut cache_store,
@@ -1076,20 +1257,19 @@ fn run_scan_worker_inner(
         return Ok(());
     }
 
-    if !preloaded_assets.is_empty() {
-        let _ = app.emit(
-            "scan://progress",
+    if changed_containers.is_empty() {
+        emit_scan_progress(
+            app,
             ScanProgressEvent {
                 scan_id: scan_id.to_string(),
-                scanned_containers: unchanged_cache.len(),
+                scanned_containers: total_containers,
                 total_containers,
                 asset_count: preloaded_assets.len(),
+                phase: ScanPhase::Caching,
                 current_source: Some("cache".to_string()),
             },
         );
-    }
 
-    if changed_containers.is_empty() {
         persist_scan_cache_entry(
             app,
             &mut cache_store,
@@ -1196,6 +1376,7 @@ fn run_scan_worker_inner(
                     &assets,
                     scanned_containers,
                     total_containers,
+                    ScanPhase::Scanning,
                     Some(source_name),
                 )?;
             }
@@ -1211,6 +1392,18 @@ fn run_scan_worker_inner(
 
     let mut all_cache_containers = unchanged_cache;
     all_cache_containers.extend(scanned_cache_containers);
+    emit_scan_progress(
+        app,
+        ScanProgressEvent {
+            scan_id: scan_id.to_string(),
+            scanned_containers,
+            total_containers,
+            asset_count: get_scan_asset_count(app, scan_id),
+            phase: ScanPhase::Caching,
+            current_source: None,
+        },
+    );
+
     persist_scan_cache_entry(
         app,
         &mut cache_store,
@@ -1378,13 +1571,12 @@ fn append_assets_chunk(
     chunk: &[AssetRecord],
     scanned_containers: usize,
     total_containers: usize,
+    phase: ScanPhase,
     current_source: Option<String>,
 ) -> Result<(), String> {
-    const CHUNK_EVENT_SIZE: usize = 200;
     const PROGRESS_THROTTLE: Duration = Duration::from_millis(125);
 
     let asset_count;
-    let mut inserted_assets = Vec::new();
     let mut should_emit_progress = false;
 
     {
@@ -1410,7 +1602,6 @@ fn append_assets_chunk(
             scan.asset_index.insert(asset.asset_id.clone(), index);
             scan.search_records.push(build_search_record(asset));
             scan.assets.push(asset.clone());
-            inserted_assets.push(asset.clone());
             add_asset_to_tree(&mut scan.tree_children, asset);
         }
 
@@ -1429,26 +1620,15 @@ fn append_assets_chunk(
         asset_count = scan.assets.len();
     }
 
-    if !inserted_assets.is_empty() {
-        for chunk in inserted_assets.chunks(CHUNK_EVENT_SIZE) {
-            let _ = app.emit(
-                "scan://chunk",
-                ScanChunkEvent {
-                    scan_id: scan_id.to_string(),
-                    assets: chunk.to_vec(),
-                },
-            );
-        }
-    }
-
     if should_emit_progress {
-        let _ = app.emit(
-            "scan://progress",
+        emit_scan_progress(
+            app,
             ScanProgressEvent {
                 scan_id: scan_id.to_string(),
                 scanned_containers,
                 total_containers,
                 asset_count,
+                phase,
                 current_source,
             },
         );
@@ -1652,18 +1832,113 @@ fn collect_scan_containers(
     Ok(containers)
 }
 
-fn resolve_scan_containers(containers: &[ScanContainer]) -> Result<Vec<ResolvedScanContainer>, String> {
-    containers
-        .iter()
-        .cloned()
-        .map(|container| {
+fn resolve_scan_containers(
+    app: &AppHandle,
+    scan_id: &str,
+    containers: Vec<ScanContainer>,
+) -> Result<Vec<ResolvedScanContainer>, String> {
+    if containers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    enum FingerprintWorkerResult {
+        Resolved {
+            index: usize,
+            resolved: ResolvedScanContainer,
+        },
+        Error(String),
+    }
+
+    let total = containers.len();
+    let workers = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .max(1)
+        .min(MAX_SCAN_FINGERPRINT_WORKERS)
+        .min(total);
+
+    let (sender, receiver) = mpsc::channel::<FingerprintWorkerResult>();
+    let next_index = Arc::new(AtomicUsize::new(0));
+    let containers = Arc::new(containers);
+
+    for _ in 0..workers {
+        let sender = sender.clone();
+        let next_index = Arc::clone(&next_index);
+        let containers = Arc::clone(&containers);
+
+        thread::spawn(move || loop {
+            let index = next_index.fetch_add(1, AtomicOrdering::Relaxed);
+            if index >= containers.len() {
+                break;
+            }
+
+            let container = containers[index].clone();
             let container_id = scan_container_id(&container);
-            let fingerprint = fingerprint_container(&container)?;
-            Ok(ResolvedScanContainer {
-                container,
-                container_id,
-                fingerprint,
-            })
+
+            match fingerprint_container(&container) {
+                Ok(fingerprint) => {
+                    let resolved = ResolvedScanContainer {
+                        container,
+                        container_id,
+                        fingerprint,
+                    };
+                    if sender
+                        .send(FingerprintWorkerResult::Resolved { index, resolved })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(FingerprintWorkerResult::Error(error));
+                    break;
+                }
+            }
+        });
+    }
+
+    drop(sender);
+
+    let mut processed = 0usize;
+    let mut resolved = vec![None; total];
+
+    while processed < total {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(FingerprintWorkerResult::Resolved {
+                index,
+                resolved: item,
+            }) => {
+                processed += 1;
+                let source = item.container.source_name.clone();
+                resolved[index] = Some(item);
+
+                emit_scan_progress(
+                    app,
+                    ScanProgressEvent {
+                        scan_id: scan_id.to_string(),
+                        scanned_containers: processed,
+                        total_containers: total,
+                        asset_count: 0,
+                        phase: ScanPhase::Fingerprinting,
+                        current_source: Some(source),
+                    },
+                );
+            }
+            Ok(FingerprintWorkerResult::Error(error)) => return Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    if processed < total {
+        return Err("Fingerprint workers disconnected before processing all containers".to_string());
+    }
+
+    resolved
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.ok_or_else(|| format!("Missing fingerprint result for container index {index}"))
         })
         .collect()
 }
@@ -1699,7 +1974,10 @@ fn fingerprint_archive_like(path: &Path) -> Result<ContainerFingerprint, String>
 
 fn fingerprint_assets_directory(path: &Path) -> Result<ContainerFingerprint, String> {
     let assets_root = path.join("assets");
-    let mut files = Vec::<AssetFileFingerprint>::new();
+    let mut file_count = 0u64;
+    let mut total_size = 0u64;
+    let mut latest_mtime_unix_ms = 0u64;
+    let mut rolling_hash = 0u64;
 
     if assets_root.is_dir() {
         for entry in WalkDir::new(&assets_root)
@@ -1720,19 +1998,29 @@ fn fingerprint_assets_directory(path: &Path) -> Result<ContainerFingerprint, Str
                 continue;
             };
 
-            files.push(AssetFileFingerprint {
-                rel_path: normalize_archive_path(relative),
-                size: metadata.len(),
-                mtime_unix_ms: file_mtime_unix_ms(&metadata),
-            });
+            let rel_path = normalize_archive_path(relative);
+            let size = metadata.len();
+            let mtime_unix_ms = file_mtime_unix_ms(&metadata);
+
+            file_count = file_count.saturating_add(1);
+            total_size = total_size.saturating_add(size);
+            latest_mtime_unix_ms = latest_mtime_unix_ms.max(mtime_unix_ms);
+
+            let mut hasher = DefaultHasher::new();
+            rel_path.hash(&mut hasher);
+            size.hash(&mut hasher);
+            mtime_unix_ms.hash(&mut hasher);
+            let entry_hash = hasher.finish();
+            rolling_hash = rolling_hash.wrapping_add(entry_hash ^ 0x9e37_79b9_7f4a_7c15);
         }
     }
 
-    files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-
     Ok(ContainerFingerprint::AssetsDir {
         path: path.to_string_lossy().to_string(),
-        files,
+        file_count,
+        total_size,
+        latest_mtime_unix_ms,
+        rolling_hash,
     })
 }
 
@@ -2557,52 +2845,431 @@ fn get_asset_from_state(
     scan_id: &str,
     asset_id: &str,
 ) -> Result<AssetRecord, String> {
-    let mut asset_ids = Vec::new();
-    asset_ids.push(asset_id.to_string());
+    let asset_ids = vec![asset_id.to_string()];
 
     collect_assets(state, scan_id, &asset_ids)
         .map(|mut assets| assets.remove(0))
         .map_err(|error| error.to_string())
 }
 
-fn materialize_asset(
-    app: &AppHandle,
-    asset: &AssetRecord,
+fn resolve_operation_id(operation_id: Option<String>) -> String {
+    operation_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+fn register_export_operation(state: &State<'_, AppState>, operation_id: &str) -> Result<(), String> {
+    let mut operations = state
+        .export_operations
+        .lock()
+        .map_err(|_| "Failed to lock export operations state".to_string())?;
+    operations.insert(operation_id.to_string(), ExportOperationState::new());
+    Ok(())
+}
+
+fn unregister_export_operation(state: &State<'_, AppState>, operation_id: &str) {
+    if let Ok(mut operations) = state.export_operations.lock() {
+        operations.remove(operation_id);
+    }
+}
+
+fn is_export_cancelled(app: &AppHandle, operation_id: &str) -> bool {
+    let state = app.state::<AppState>();
+    let Ok(operations) = state.export_operations.lock() else {
+        return true;
+    };
+
+    operations
+        .get(operation_id)
+        .map(|operation| operation.cancelled)
+        .unwrap_or(false)
+}
+
+fn emit_scan_progress(app: &AppHandle, event: ScanProgressEvent) {
+    let _ = app.emit("scan://progress", event);
+}
+
+fn get_scan_asset_count(app: &AppHandle, scan_id: &str) -> usize {
+    let state = app.state::<AppState>();
+    let Ok(scans) = state.scans.lock() else {
+        return 0;
+    };
+
+    scans.get(scan_id).map(|scan| scan.assets.len()).unwrap_or(0)
+}
+
+fn emit_export_progress(app: &AppHandle, event: ExportProgressEvent) {
+    let _ = app.emit("export://progress", event);
+}
+
+fn emit_export_completed(app: &AppHandle, event: ExportCompletedEvent) {
+    let _ = app.emit("export://completed", event);
+}
+
+#[derive(Debug, Clone)]
+struct ExportJob {
+    index: usize,
+    asset: AssetRecord,
+    output_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct ExportRunOutcome {
+    output_files: Vec<String>,
+    processed_count: usize,
+    success_count: usize,
+    failed_count: usize,
+    cancelled: bool,
+    failures: Vec<ExportFailure>,
+}
+
+#[derive(Debug)]
+enum ExportWorkerResult {
+    Success { index: usize, output_path: PathBuf },
+    Failure { index: usize, failure: ExportFailure },
+}
+
+fn plan_export_jobs(
+    assets: Vec<AssetRecord>,
     destination_dir: &Path,
     audio_format: AudioFormat,
-    used_names: &mut HashSet<String>,
-) -> Result<PathBuf, String> {
-    let original_name = Path::new(&asset.relative_asset_path)
-        .file_name()
-        .map(|value| value.to_string_lossy().to_string())
-        .unwrap_or_else(|| asset.asset_id.clone());
+) -> Vec<ExportJob> {
+    let mut used_names = HashSet::new();
+    let mut jobs = Vec::new();
 
-    let (base_stem, mut extension) = split_file_name(&original_name);
-    if asset.is_audio {
-        match audio_format {
-            AudioFormat::Original => {}
-            AudioFormat::Mp3 => extension = "mp3".to_string(),
-            AudioFormat::Wav => extension = "wav".to_string(),
+    for (index, asset) in assets.into_iter().enumerate() {
+        let original_name = Path::new(&asset.relative_asset_path)
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| asset.asset_id.clone());
+
+        let (base_stem, mut extension) = split_file_name(&original_name);
+        if asset.is_audio {
+            match audio_format {
+                AudioFormat::Original => {}
+                AudioFormat::Mp3 => extension = "mp3".to_string(),
+                AudioFormat::Wav => extension = "wav".to_string(),
+            }
+        }
+
+        let target_name = dedupe_file_name(&base_stem, &extension, destination_dir, &mut used_names);
+        jobs.push(ExportJob {
+            index,
+            asset,
+            output_path: destination_dir.join(target_name),
+        });
+    }
+
+    jobs
+}
+
+fn run_export_operation(
+    app: &AppHandle,
+    kind: ExportOperationKind,
+    operation_id: &str,
+    assets: Vec<AssetRecord>,
+    destination_dir: &Path,
+    audio_format: AudioFormat,
+) -> Result<ExportRunOutcome, String> {
+    let jobs = plan_export_jobs(assets, destination_dir, audio_format.clone());
+    let requested_count = jobs.len();
+
+    if requested_count == 0 {
+        emit_export_progress(
+            app,
+            ExportProgressEvent {
+                operation_id: operation_id.to_string(),
+                kind: kind.clone(),
+                requested_count,
+                processed_count: 0,
+                success_count: 0,
+                failed_count: 0,
+                cancelled: false,
+            },
+        );
+        emit_export_completed(
+            app,
+            ExportCompletedEvent {
+                operation_id: operation_id.to_string(),
+                kind,
+                requested_count,
+                processed_count: 0,
+                success_count: 0,
+                failed_count: 0,
+                cancelled: false,
+                failures: Vec::new(),
+            },
+        );
+        return Ok(ExportRunOutcome {
+            output_files: Vec::new(),
+            processed_count: 0,
+            success_count: 0,
+            failed_count: 0,
+            cancelled: false,
+            failures: Vec::new(),
+        });
+    }
+
+    let should_convert_audio = audio_format != AudioFormat::Original
+        && jobs.iter().any(|job| job.asset.is_audio);
+    let ffmpeg_path = if should_convert_audio {
+        Some(resolve_ffmpeg_path(app)?)
+    } else {
+        None
+    };
+
+    emit_export_progress(
+        app,
+        ExportProgressEvent {
+            operation_id: operation_id.to_string(),
+            kind: kind.clone(),
+            requested_count,
+            processed_count: 0,
+            success_count: 0,
+            failed_count: 0,
+            cancelled: false,
+        },
+    );
+
+    let workers = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .max(1)
+        .min(MAX_EXPORT_WORKERS)
+        .min(requested_count);
+
+    let (sender, receiver) = mpsc::channel::<ExportWorkerResult>();
+    let jobs = Arc::new(jobs);
+    let next_index = Arc::new(AtomicUsize::new(0));
+    let operation_id_owned = operation_id.to_string();
+
+    for _ in 0..workers {
+        let sender = sender.clone();
+        let jobs = Arc::clone(&jobs);
+        let next_index = Arc::clone(&next_index);
+        let app = app.clone();
+        let operation_id = operation_id_owned.clone();
+        let ffmpeg_path = ffmpeg_path.clone();
+        let audio_format = audio_format.clone();
+
+        thread::spawn(move || {
+            let mut archive_cache = HashMap::<String, ZipArchive<fs::File>>::new();
+
+            loop {
+                if is_export_cancelled(&app, &operation_id) {
+                    break;
+                }
+
+                let index = next_index.fetch_add(1, AtomicOrdering::Relaxed);
+                if index >= jobs.len() {
+                    break;
+                }
+
+                let job = &jobs[index];
+                let result = materialize_export_job(
+                    job,
+                    &audio_format,
+                    ffmpeg_path.as_deref(),
+                    &mut archive_cache,
+                );
+
+                let worker_message = match result {
+                    Ok(path) => ExportWorkerResult::Success {
+                        index: job.index,
+                        output_path: path,
+                    },
+                    Err(error) => ExportWorkerResult::Failure {
+                        index: job.index,
+                        failure: ExportFailure {
+                            asset_id: job.asset.asset_id.clone(),
+                            key: job.asset.key.clone(),
+                            error,
+                        },
+                    },
+                };
+
+                if sender.send(worker_message).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    drop(sender);
+
+    let mut processed_count = 0usize;
+    let mut success_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut failures = Vec::<ExportFailure>::new();
+    let mut output_files = vec![None; requested_count];
+
+    while processed_count < requested_count {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(ExportWorkerResult::Success { index, output_path }) => {
+                processed_count += 1;
+                success_count += 1;
+                output_files[index] = Some(output_path.to_string_lossy().to_string());
+            }
+            Ok(ExportWorkerResult::Failure { index, failure }) => {
+                processed_count += 1;
+                failed_count += 1;
+                output_files[index] = None;
+                failures.push(failure);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if is_export_cancelled(app, operation_id) {
+                    continue;
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        emit_export_progress(
+            app,
+            ExportProgressEvent {
+                operation_id: operation_id.to_string(),
+                kind: kind.clone(),
+                requested_count,
+                processed_count,
+                success_count,
+                failed_count,
+                cancelled: is_export_cancelled(app, operation_id),
+            },
+        );
+    }
+
+    while let Ok(result) = receiver.try_recv() {
+        match result {
+            ExportWorkerResult::Success { index, output_path } => {
+                processed_count += 1;
+                success_count += 1;
+                output_files[index] = Some(output_path.to_string_lossy().to_string());
+            }
+            ExportWorkerResult::Failure { index, failure } => {
+                processed_count += 1;
+                failed_count += 1;
+                output_files[index] = None;
+                failures.push(failure);
+            }
         }
     }
 
-    let target_name = dedupe_file_name(&base_stem, &extension, destination_dir, used_names);
-    let output_path = destination_dir.join(target_name);
-
-    if asset.is_audio && audio_format != AudioFormat::Original {
-        convert_asset_audio_to_file(app, asset, &output_path, &audio_format)?;
-        return Ok(output_path);
+    let cancelled = is_export_cancelled(app, operation_id);
+    if processed_count < requested_count && !cancelled {
+        return Err("Export workers disconnected before processing all assets".to_string());
     }
 
-    let bytes = extract_asset_bytes(asset)?;
-    fs::write(&output_path, bytes).map_err(|error| {
-        format!(
-            "Failed to write output file {}: {error}",
-            output_path.display()
-        )
-    })?;
+    let output_files = output_files.into_iter().flatten().collect::<Vec<_>>();
+    emit_export_completed(
+        app,
+        ExportCompletedEvent {
+            operation_id: operation_id.to_string(),
+            kind: kind.clone(),
+            requested_count,
+            processed_count,
+            success_count,
+            failed_count,
+            cancelled,
+            failures: failures.clone(),
+        },
+    );
 
-    Ok(output_path)
+    Ok(ExportRunOutcome {
+        output_files,
+        processed_count,
+        success_count,
+        failed_count,
+        cancelled,
+        failures,
+    })
+}
+
+fn materialize_export_job(
+    job: &ExportJob,
+    audio_format: &AudioFormat,
+    ffmpeg_path: Option<&Path>,
+    archive_cache: &mut HashMap<String, ZipArchive<fs::File>>,
+) -> Result<PathBuf, String> {
+    let bytes = extract_asset_bytes_with_archive_cache(&job.asset, archive_cache)?;
+
+    if job.asset.is_audio && *audio_format != AudioFormat::Original {
+        let ffmpeg_path = ffmpeg_path.ok_or_else(|| "FFmpeg path was not resolved".to_string())?;
+        convert_audio_bytes_to_file(ffmpeg_path, &bytes, &job.output_path, audio_format)?;
+    } else {
+        fs::write(&job.output_path, bytes).map_err(|error| {
+            format!(
+                "Failed to write output file {}: {error}",
+                job.output_path.display()
+            )
+        })?;
+    }
+
+    Ok(job.output_path.clone())
+}
+
+fn convert_audio_bytes_to_file(
+    ffmpeg_path: &Path,
+    input_bytes: &[u8],
+    output_path: &Path,
+    format: &AudioFormat,
+) -> Result<(), String> {
+    let mut command = Command::new(ffmpeg_path);
+    command.arg("-y");
+    command.arg("-hide_banner");
+    command.arg("-loglevel");
+    command.arg("error");
+    command.arg("-i");
+    command.arg("pipe:0");
+    command.arg("-vn");
+
+    match format {
+        AudioFormat::Original => {
+            command.arg("-c:a");
+            command.arg("copy");
+        }
+        AudioFormat::Mp3 => {
+            command.arg("-c:a");
+            command.arg("libmp3lame");
+            command.arg("-q:a");
+            command.arg("2");
+        }
+        AudioFormat::Wav => {
+            command.arg("-c:a");
+            command.arg("pcm_s16le");
+        }
+    }
+
+    command.arg(output_path);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Failed to start ffmpeg: {error}"))?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
+        stdin
+            .write_all(input_bytes)
+            .map_err(|error| format!("Failed to stream audio data to ffmpeg: {error}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("Failed to wait for ffmpeg: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("FFmpeg conversion failed: {}", stderr.trim()));
+    }
+
+    Ok(())
 }
 
 fn split_file_name(file_name: &str) -> (String, String) {
@@ -2648,60 +3315,6 @@ fn dedupe_file_name(
         used_names.insert(candidate.clone());
         return candidate;
     }
-}
-
-fn convert_asset_audio_to_file(
-    app: &AppHandle,
-    asset: &AssetRecord,
-    output_path: &Path,
-    format: &AudioFormat,
-) -> Result<(), String> {
-    let ffmpeg_path = resolve_ffmpeg_path(app)?;
-
-    let temp_input = output_path.with_extension(format!("{}.tmp", asset.extension));
-    let bytes = extract_asset_bytes(asset)?;
-    fs::write(&temp_input, bytes)
-        .map_err(|error| format!("Failed to write temporary audio input: {error}"))?;
-
-    let mut command = Command::new(&ffmpeg_path);
-    command.arg("-y");
-    command.arg("-i");
-    command.arg(&temp_input);
-    command.arg("-vn");
-
-    match format {
-        AudioFormat::Original => {
-            command.arg("-c:a");
-            command.arg("copy");
-        }
-        AudioFormat::Mp3 => {
-            command.arg("-c:a");
-            command.arg("libmp3lame");
-            command.arg("-q:a");
-            command.arg("2");
-        }
-        AudioFormat::Wav => {
-            command.arg("-c:a");
-            command.arg("pcm_s16le");
-        }
-    }
-
-    command.arg(output_path);
-
-    let status = command
-        .status()
-        .map_err(|error| format!("Failed to start ffmpeg: {error}"))?;
-
-    let _ = fs::remove_file(&temp_input);
-
-    if !status.success() {
-        return Err(
-            "FFmpeg conversion failed. Install FFmpeg or retry download in app settings."
-                .to_string(),
-        );
-    }
-
-    Ok(())
 }
 
 fn resolve_ffmpeg_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2756,6 +3369,14 @@ fn ffmpeg_works(path: &Path) -> bool {
 }
 
 fn extract_asset_bytes(asset: &AssetRecord) -> Result<Vec<u8>, String> {
+    let mut archive_cache = HashMap::<String, ZipArchive<fs::File>>::new();
+    extract_asset_bytes_with_archive_cache(asset, &mut archive_cache)
+}
+
+fn extract_asset_bytes_with_archive_cache(
+    asset: &AssetRecord,
+    archive_cache: &mut HashMap<String, ZipArchive<fs::File>>,
+) -> Result<Vec<u8>, String> {
     let container_path = PathBuf::from(&asset.container_path);
 
     match asset.container_type {
@@ -2765,23 +3386,29 @@ fn extract_asset_bytes(asset: &AssetRecord) -> Result<Vec<u8>, String> {
                 .map_err(|error| format!("Failed to read file {}: {error}", file_path.display()))
         }
         AssetContainerType::AssetIndex => Err(
-            "AssetIndex container type is metadata-only and cannot be extracted directly"
+                "AssetIndex container type is metadata-only and cannot be extracted directly"
                 .to_string(),
         ),
         AssetContainerType::Zip | AssetContainerType::Jar => {
-            let file = fs::File::open(&container_path).map_err(|error| {
-                format!(
-                    "Failed to open archive {}: {error}",
-                    container_path.display()
-                )
-            })?;
+            if !archive_cache.contains_key(&asset.container_path) {
+                let file = fs::File::open(&container_path).map_err(|error| {
+                    format!(
+                        "Failed to open archive {}: {error}",
+                        container_path.display()
+                    )
+                })?;
+                let archive = ZipArchive::new(file).map_err(|error| {
+                    format!(
+                        "Failed to read archive {}: {error}",
+                        container_path.display()
+                    )
+                })?;
+                archive_cache.insert(asset.container_path.clone(), archive);
+            }
 
-            let mut archive = ZipArchive::new(file).map_err(|error| {
-                format!(
-                    "Failed to read archive {}: {error}",
-                    container_path.display()
-                )
-            })?;
+            let archive = archive_cache
+                .get_mut(&asset.container_path)
+                .ok_or_else(|| "Failed to get cached archive".to_string())?;
 
             let mut entry = archive.by_name(&asset.entry_path).map_err(|error| {
                 format!("Failed to open archive entry {}: {error}", asset.entry_path)
@@ -3032,6 +3659,7 @@ pub fn run() {
             start_scan,
             get_scan_status,
             cancel_scan,
+            cancel_export,
             list_tree_children,
             search_assets,
             get_asset_preview,
