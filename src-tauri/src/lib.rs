@@ -1175,29 +1175,14 @@ fn run_scan_worker_inner(
     let has_cached_snapshot = !cached_containers_by_id.is_empty();
 
     if has_cached_snapshot {
-        let cached_asset_count = cached_containers_by_id
-            .values()
-            .map(|container| container.assets.len())
-            .sum::<usize>();
-
         replace_scan_state_from_cached_containers(
             app,
             scan_id,
             cached_containers_by_id.values(),
             total_containers_hint,
             total_containers_hint,
+            Some("cache"),
         )?;
-        emit_scan_progress(
-            app,
-            ScanProgressEvent {
-                scan_id: scan_id.to_string(),
-                scanned_containers: total_containers_hint,
-                total_containers: total_containers_hint,
-                asset_count: cached_asset_count,
-                phase: ScanPhase::Scanning,
-                current_source: Some("cache".to_string()),
-            },
-        );
         complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
     } else {
         emit_scan_progress(
@@ -1274,6 +1259,7 @@ fn run_scan_worker_inner(
             unchanged_cache.iter(),
             total_containers,
             total_containers,
+            Some("cache-refresh"),
         )?;
         complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
         persist_scan_cache_entry_async(
@@ -1422,6 +1408,7 @@ fn run_scan_worker_inner(
             all_cache_containers.iter(),
             total_containers,
             total_containers,
+            Some("cache-finalize"),
         )?;
     }
     complete_scan_with_lifecycle(app, scan_id, ScanLifecycle::Completed, None)?;
@@ -1442,29 +1429,104 @@ fn replace_scan_state_from_cached_containers<'a>(
     containers: impl Iterator<Item = &'a CachedContainer>,
     scanned_containers: usize,
     total_containers: usize,
+    progress_source: Option<&str>,
 ) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    let mut scans = state
-        .scans
-        .lock()
-        .map_err(|_| "Failed to lock scans state".to_string())?;
+    let containers = containers.collect::<Vec<_>>();
+    {
+        let state = app.state::<AppState>();
+        let mut scans = state
+            .scans
+            .lock()
+            .map_err(|_| "Failed to lock scans state".to_string())?;
 
-    let scan = scans
-        .get_mut(scan_id)
-        .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
+        let scan = scans
+            .get_mut(scan_id)
+            .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
 
-    scan.scanned_containers = scanned_containers;
-    scan.total_containers = total_containers;
-    scan.assets.clear();
-    scan.asset_index.clear();
-    scan.search_records.clear();
-    scan.tree_children.clear();
-    scan.tree_children
-        .insert(ROOT_NODE_ID.to_string(), Vec::new());
-    scan.last_progress_emit_at = None;
+        scan.scanned_containers = 0;
+        scan.total_containers = total_containers;
+        scan.assets.clear();
+        scan.asset_index.clear();
+        scan.search_records.clear();
+        scan.tree_children.clear();
+        scan.tree_children
+            .insert(ROOT_NODE_ID.to_string(), Vec::new());
+        scan.last_progress_emit_at = None;
+    }
 
-    for container in containers {
-        append_cached_assets_to_scan_state(scan, &container.assets);
+    let mut last_progress_emit_at = Instant::now() - Duration::from_millis(200);
+    for (index, container) in containers.iter().enumerate() {
+        let interim_scanned = if containers.is_empty() {
+            scanned_containers
+        } else {
+            ((index + 1) * scanned_containers) / containers.len()
+        };
+
+        let asset_count = {
+            let state = app.state::<AppState>();
+            let mut scans = state
+                .scans
+                .lock()
+                .map_err(|_| "Failed to lock scans state".to_string())?;
+
+            let scan = scans
+                .get_mut(scan_id)
+                .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
+
+            append_cached_assets_to_scan_state(scan, &container.assets);
+            scan.scanned_containers = interim_scanned;
+            scan.total_containers = total_containers;
+            scan.assets.len()
+        };
+
+        if let Some(source) = progress_source {
+            let now = Instant::now();
+            let is_last = index + 1 >= containers.len();
+            if is_last || now.saturating_duration_since(last_progress_emit_at) >= Duration::from_millis(125)
+            {
+                last_progress_emit_at = now;
+                emit_scan_progress(
+                    app,
+                    ScanProgressEvent {
+                        scan_id: scan_id.to_string(),
+                        scanned_containers: interim_scanned,
+                        total_containers,
+                        asset_count,
+                        phase: ScanPhase::Scanning,
+                        current_source: Some(source.to_string()),
+                    },
+                );
+            }
+        }
+    }
+
+    let final_asset_count = {
+        let state = app.state::<AppState>();
+        let mut scans = state
+            .scans
+            .lock()
+            .map_err(|_| "Failed to lock scans state".to_string())?;
+
+        let scan = scans
+            .get_mut(scan_id)
+            .ok_or_else(|| format!("Unknown scan id: {scan_id}"))?;
+        scan.scanned_containers = scanned_containers;
+        scan.total_containers = total_containers;
+        scan.assets.len()
+    };
+
+    if let Some(source) = progress_source {
+        emit_scan_progress(
+            app,
+            ScanProgressEvent {
+                scan_id: scan_id.to_string(),
+                scanned_containers,
+                total_containers,
+                asset_count: final_asset_count,
+                phase: ScanPhase::Scanning,
+                current_source: Some(source.to_string()),
+            },
+        );
     }
 
     Ok(())
