@@ -222,8 +222,17 @@ function resolveLinuxDockerPlatform(triples) {
   return triples.some((triple) => triple.includes('aarch64')) ? 'linux/arm64' : 'linux/amd64';
 }
 
-function dockerImageExists(image) {
-  return runQuiet('docker', ['image', 'inspect', image]).ok;
+function dockerImageArchitecture(image) {
+  const result = runQuiet('docker', ['image', 'inspect', '--format', '{{.Architecture}}', image]);
+  if (!result.ok) {
+    return null;
+  }
+
+  return result.stdout.trim();
+}
+
+function architectureForPlatform(platform) {
+  return platform.endsWith('/arm64') ? 'arm64' : 'amd64';
 }
 
 function sleepMs(ms) {
@@ -263,7 +272,7 @@ function tryStartDockerDaemon() {
   return false;
 }
 
-function ensureLinuxDockerImage() {
+function ensureLinuxDockerImage(dockerPlatform) {
   if (!commandExists('docker')) {
     console.error('[build] Docker is required for Linux builds on non-Linux hosts.');
     console.error('[build] Install Docker Desktop and rerun, or set BUILD_LINUX_USE_DOCKER=0 to use direct cross-compilation.');
@@ -277,13 +286,26 @@ function ensureLinuxDockerImage() {
   }
 
   const forceRebuild = process.env.BUILD_REFRESH_LINUX_DOCKER_IMAGE === '1';
-  if (!forceRebuild && dockerImageExists(linuxDockerImage)) {
+  const expectedArch = architectureForPlatform(dockerPlatform);
+  const existingArch = dockerImageArchitecture(linuxDockerImage);
+  if (!forceRebuild && existingArch === expectedArch) {
     return true;
   }
 
-  console.log(`[build] Building Linux builder image (${linuxDockerImage})...`);
+  if (existingArch && existingArch !== expectedArch) {
+    console.log(
+      `[build] Rebuilding Linux builder image for ${dockerPlatform} (found local ${existingArch}, need ${expectedArch})...`
+    );
+  } else {
+    console.log(`[build] Building Linux builder image (${linuxDockerImage}) for ${dockerPlatform}...`);
+  }
+
   const built = run('docker', [
+    'buildx',
     'build',
+    '--load',
+    '--platform',
+    dockerPlatform,
     '--file',
     linuxDockerfilePath,
     '--tag',
@@ -299,13 +321,13 @@ function ensureLinuxDockerImage() {
 }
 
 function buildLinuxWithDocker() {
-  if (!ensureLinuxDockerImage()) {
-    return false;
-  }
-
   const linuxTriples = resolveLinuxDockerTargetTriples();
   const dockerPlatform = resolveLinuxDockerPlatform(linuxTriples);
   const linuxTargetsValue = linuxTriples.join(',');
+  if (!ensureLinuxDockerImage(dockerPlatform)) {
+    return false;
+  }
+
   console.log(`[build] Building linux release bundles in Docker (${dockerPlatform}) for target(s): ${linuxTargetsValue}`);
 
   const containerCommand = 'set -euo pipefail; bun install --frozen-lockfile; node scripts/build-release.mjs linux';
