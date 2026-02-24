@@ -227,6 +227,7 @@ function App() {
   const lastScanProgressAtRef = useRef(0);
   const terminalScanSyncRef = useRef<string | null>(null);
   const isSyncingScanStatusRef = useRef(false);
+  const scanStartAtRef = useRef<Record<string, number>>({});
   const searchRequestSeqRef = useRef(0);
   const isSearchLoadingRef = useRef(false);
   const hasMoreSearchRef = useRef(false);
@@ -375,6 +376,14 @@ function App() {
         hasMoreSearchRef.current = nextOffset < response.total;
         setSearchTotal(response.total);
         setHasMoreSearch(nextOffset < response.total);
+        if (reset) {
+          const startedAt = scanStartAtRef.current[resolvedScanId];
+          if (startedAt) {
+            const elapsedMs = Math.round(performance.now() - startedAt);
+            console.info(`[scan-perf] first search page for ${resolvedScanId}: ${elapsedMs}ms`);
+            delete scanStartAtRef.current[resolvedScanId];
+          }
+        }
       } catch (error) {
         if (requestId === searchRequestSeqRef.current) {
           setStatusLine(String(error));
@@ -623,6 +632,7 @@ function App() {
       });
 
       activeScanIdRef.current = response.scanId;
+      scanStartAtRef.current[response.scanId] = performance.now();
       setScanId(response.scanId);
       if (response.cacheHit) {
         setLifecycle("completed");
