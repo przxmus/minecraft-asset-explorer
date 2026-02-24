@@ -719,6 +719,13 @@ fn scan_cache_snapshot_path(cache_root: &Path, cache_key: &str) -> PathBuf {
     cache_root.join(scan_cache_snapshot_file_name(cache_key))
 }
 
+fn has_cached_snapshot(app: &AppHandle, cache_key: &str) -> bool {
+    let Ok(cache_root) = scan_cache_root(app) else {
+        return false;
+    };
+    scan_cache_snapshot_path(&cache_root, cache_key).is_file()
+}
+
 fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let temp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     let bytes = serde_json::to_vec(value)
@@ -997,6 +1004,7 @@ fn start_scan(
     let scan_id = Uuid::new_v4().to_string();
     let force_rescan = req.force_rescan.unwrap_or(false);
     let cache_key = scan_cache_key_for_request(&req);
+    let likely_cache_hit = !force_rescan && has_cached_snapshot(&app, &cache_key);
 
     {
         let mut scans = state
@@ -1004,7 +1012,9 @@ fn start_scan(
             .lock()
             .map_err(|_| "Failed to lock scans state".to_string())?;
 
-        scans.insert(scan_id.clone(), ScanState::new());
+        let mut scan_state = ScanState::new();
+        scan_state.is_refreshing = likely_cache_hit;
+        scans.insert(scan_id.clone(), scan_state);
     }
 
     let _ = app.emit(
@@ -1019,10 +1029,18 @@ fn start_scan(
         ScanProgressEvent {
             scan_id: scan_id.clone(),
             scanned_containers: 0,
-            total_containers: 0,
+            total_containers: if likely_cache_hit { 1 } else { 0 },
             asset_count: 0,
-            phase: ScanPhase::Estimating,
-            current_source: None,
+            phase: if likely_cache_hit {
+                ScanPhase::Refreshing
+            } else {
+                ScanPhase::Estimating
+            },
+            current_source: if likely_cache_hit {
+                Some("cache".to_string())
+            } else {
+                None
+            },
         },
     );
 
@@ -1042,9 +1060,13 @@ fn start_scan(
 
     Ok(StartScanResponse {
         scan_id,
-        cache_hit: false,
-        refresh_started: false,
-        refresh_mode: None,
+        cache_hit: likely_cache_hit,
+        refresh_started: likely_cache_hit,
+        refresh_mode: if likely_cache_hit {
+            Some("incremental".to_string())
+        } else {
+            None
+        },
     })
 }
 

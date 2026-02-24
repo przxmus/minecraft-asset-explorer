@@ -239,7 +239,6 @@ function App() {
   const autoScanTimeoutRef = useRef<number | null>(null);
   const lastScanConfigKeyRef = useRef<string | null>(null);
   const progressRef = useRef<ScanProgressEvent | null>(null);
-  const isRefreshingRef = useRef(false);
   const listParentRef = useRef<HTMLDivElement | null>(null);
   const previewContentRef = useRef<HTMLDivElement | null>(null);
   const previewPanelRef = useRef<HTMLElement | null>(null);
@@ -481,10 +480,6 @@ function App() {
     progressRef.current = progress;
   }, [progress]);
 
-  useEffect(() => {
-    isRefreshingRef.current = isRefreshing;
-  }, [isRefreshing]);
-
   const syncScanStatus = useCallback(
     async (targetScanId: string) => {
       if (isSyncingScanStatusRef.current) {
@@ -656,22 +651,17 @@ function App() {
       scanStartAtRef.current[response.scanId] = performance.now();
       setScanId(response.scanId);
       if (response.cacheHit) {
-        setLifecycle("completed");
-        setIsRefreshing(response.refreshStarted);
-        setProgress((current) =>
-          current ?? {
-            scanId: response.scanId,
-            scannedContainers: 0,
-            totalContainers: 0,
-            assetCount: 0,
-            phase: response.refreshStarted ? "refreshing" : "estimating",
-          },
-        );
-        setStatusLine(
-          response.refreshStarted
-            ? "Loaded cached index instantly. Refreshing cache in background..."
-            : "Loaded cached index instantly.",
-        );
+        setLifecycle("scanning");
+        setIsRefreshing(true);
+        setProgress({
+          scanId: response.scanId,
+          scannedContainers: 0,
+          totalContainers: 1,
+          assetCount: 0,
+          phase: "refreshing",
+          currentSource: "cache",
+        });
+        setStatusLine("Loading cached index...");
       } else {
         setProgress({
           scanId: response.scanId,
@@ -1268,23 +1258,16 @@ function App() {
           return;
         }
 
-        const wasRefreshing = isRefreshingRef.current;
         terminalScanSyncRef.current = event.payload.scanId;
         setLifecycle(event.payload.lifecycle);
-        setIsRefreshing(false);
         lastScanProgressAtRef.current = Date.now();
-        setStatusLine(
-          event.payload.lifecycle === "completed"
-            ? wasRefreshing
-              ? `Refresh completed: ${event.payload.assetCount} assets indexed.`
-              : `Scan completed: ${event.payload.assetCount} assets indexed.`
-            : `Scan finished with status: ${event.payload.lifecycle}`,
-        );
+        setStatusLine("Finalizing scan state...");
 
         void refreshVisibleTreeNodes();
-        if (wasRefreshing && event.payload.lifecycle === "completed") {
+        if (event.payload.lifecycle === "completed") {
           void reconcileSelectionState(event.payload.scanId);
         }
+        void syncScanStatus(event.payload.scanId);
         setScanRefreshToken((value) => value + 1);
       });
 
