@@ -192,6 +192,7 @@ function App() {
   const lastStatusAtRef = useRef(0);
   const expandedNodesRef = useRef<Set<string>>(new Set());
   const autoScanTimeoutRef = useRef<number | null>(null);
+  const lastScanConfigKeyRef = useRef<string | null>(null);
   const progressRef = useRef<ScanProgressEvent | null>(null);
   const listParentRef = useRef<HTMLDivElement | null>(null);
   const previewContentRef = useRef<HTMLDivElement | null>(null);
@@ -440,6 +441,9 @@ function App() {
       setStatusLine("Select at least one source to scan.");
       return;
     }
+
+    const scanConfigKey = `${prismRootCommitted}::${selectedInstance}::${includeVanilla ? "v" : "-"}${includeMods ? "m" : "-"}${includeResourcepacks ? "r" : "-"}`;
+    lastScanConfigKeyRef.current = scanConfigKey;
 
     setIsStartingScan(true);
 
@@ -896,10 +900,17 @@ function App() {
     }
 
     if (!prismRootCommitted || !selectedInstance) {
+      lastScanConfigKeyRef.current = null;
       return;
     }
 
     if (!includeVanilla && !includeMods && !includeResourcepacks) {
+      lastScanConfigKeyRef.current = null;
+      return;
+    }
+
+    const scanConfigKey = `${prismRootCommitted}::${selectedInstance}::${includeVanilla ? "v" : "-"}${includeMods ? "m" : "-"}${includeResourcepacks ? "r" : "-"}`;
+    if (scanConfigKey === lastScanConfigKeyRef.current) {
       return;
     }
 
@@ -907,6 +918,7 @@ function App() {
       return;
     }
 
+    lastScanConfigKeyRef.current = scanConfigKey;
     autoScanTimeoutRef.current = window.setTimeout(() => {
       void startScan();
     }, AUTO_SCAN_DEBOUNCE_MS);
