@@ -26,10 +26,11 @@ use walkdir::WalkDir;
 use zip::ZipArchive;
 
 const ROOT_NODE_ID: &str = "root";
-const MAX_SCAN_WORKERS: usize = 6;
+const MAX_SCAN_WORKERS: usize = 4;
 const MAX_EXPORT_WORKERS: usize = 16;
 const SCAN_CACHE_SCHEMA_VERSION: u32 = 1;
 const SCAN_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const SCAN_CANCEL_CHECK_INTERVAL: usize = 128;
 
 #[derive(Default)]
 struct AppState {
@@ -786,10 +787,7 @@ fn prune_scan_cache(cache_root: &Path, manifest: &mut ScanCacheManifest) {
     }
 }
 
-fn load_cached_snapshot(
-    app: &AppHandle,
-    cache_key: &str,
-) -> Result<Option<(ScanSnapshot, ScanCacheManifest)>, String> {
+fn load_cached_snapshot(app: &AppHandle, cache_key: &str) -> Result<Option<ScanSnapshot>, String> {
     let cache_root = scan_cache_root(app)?;
     let mut manifest = load_scan_cache_manifest(&cache_root)?;
     let snapshot_path = scan_cache_snapshot_path(&cache_root, cache_key);
@@ -832,7 +830,7 @@ fn load_cached_snapshot(
         });
     entry.last_accessed_at = now;
     let _ = save_scan_cache_manifest(&cache_root, &manifest);
-    Ok(Some((parsed, manifest)))
+    Ok(Some(parsed))
 }
 
 fn save_snapshot_to_cache(app: &AppHandle, snapshot: &ScanSnapshot) -> Result<(), String> {
@@ -1016,74 +1014,6 @@ fn start_scan(
         }),
     );
 
-    if !force_rescan {
-        if let Some((snapshot, _manifest)) = load_cached_snapshot(&app, &cache_key)? {
-            let cached_asset_count = snapshot.assets.len();
-            {
-                let state = app.state::<AppState>();
-                let mut scans = state
-                    .scans
-                    .lock()
-                    .map_err(|_| "Failed to lock scans state".to_string())?;
-                if let Some(scan) = scans.get_mut(&scan_id) {
-                    scan.status = ScanLifecycle::Completed;
-                    scan.is_refreshing = true;
-                    scan.scanned_containers = snapshot.container_signatures.len();
-                    scan.total_containers = snapshot.container_signatures.len();
-                    scan.error = None;
-                    scan.cancelled = false;
-                    scan.assets = snapshot.assets;
-                    scan.asset_index = scan
-                        .assets
-                        .iter()
-                        .enumerate()
-                        .map(|(index, asset)| (asset.asset_id.clone(), index))
-                        .collect();
-                    scan.search_records = if snapshot.search_records.len() == scan.assets.len() {
-                        snapshot.search_records
-                    } else {
-                        scan.assets.iter().map(build_search_record).collect()
-                    };
-                    scan.tree_children = snapshot.tree_children;
-                    scan.container_assets = snapshot.container_assets;
-                    scan.container_signatures = snapshot.container_signatures;
-                    scan.id_aliases = HashMap::new();
-                    scan.cache_key = Some(cache_key.clone());
-                }
-            }
-
-            let _ = app.emit(
-                "scan://completed",
-                ScanCompletedEvent {
-                    scan_id: scan_id.clone(),
-                    lifecycle: ScanLifecycle::Completed,
-                    asset_count: cached_asset_count,
-                    error: None,
-                },
-            );
-
-            let scan_id_for_worker = scan_id.clone();
-            let app_for_worker = app.clone();
-            let req_for_worker = req.clone();
-            let cache_key_for_worker = cache_key.clone();
-            thread::spawn(move || {
-                run_refresh_worker(
-                    app_for_worker,
-                    scan_id_for_worker,
-                    req_for_worker,
-                    cache_key_for_worker,
-                );
-            });
-
-            return Ok(StartScanResponse {
-                scan_id,
-                cache_hit: true,
-                refresh_started: true,
-                refresh_mode: Some("incremental".to_string()),
-            });
-        }
-    }
-
     emit_scan_progress(
         &app,
         ScanProgressEvent {
@@ -1098,8 +1028,16 @@ fn start_scan(
 
     let scan_id_for_worker = scan_id.clone();
     let app_for_worker = app.clone();
+    let req_for_worker = req.clone();
+    let cache_key_for_worker = cache_key.clone();
     thread::spawn(move || {
-        run_scan_worker(app_for_worker, scan_id_for_worker, req, cache_key);
+        run_scan_bootstrap_worker(
+            app_for_worker,
+            scan_id_for_worker,
+            req_for_worker,
+            cache_key_for_worker,
+            force_rescan,
+        );
     });
 
     Ok(StartScanResponse {
@@ -1569,6 +1507,88 @@ fn convert_audio_asset(
     })
 }
 
+fn run_scan_bootstrap_worker(
+    app: AppHandle,
+    scan_id: String,
+    req: StartScanRequest,
+    cache_key: String,
+    force_rescan: bool,
+) {
+    let result = run_scan_bootstrap_worker_inner(&app, &scan_id, &req, &cache_key, force_rescan);
+    if let Err(error) = result {
+        update_scan_error(&app, &scan_id, &error);
+        let _ = app.emit(
+            "scan://error",
+            serde_json::json!({
+                "scanId": scan_id,
+                "error": error,
+            }),
+        );
+    }
+}
+
+fn run_scan_bootstrap_worker_inner(
+    app: &AppHandle,
+    scan_id: &str,
+    req: &StartScanRequest,
+    cache_key: &str,
+    force_rescan: bool,
+) -> Result<(), String> {
+    if !force_rescan {
+        if let Some(snapshot) = load_cached_snapshot(app, cache_key)? {
+            let cached_asset_count = snapshot.assets.len();
+            {
+                let state = app.state::<AppState>();
+                let mut scans = state
+                    .scans
+                    .lock()
+                    .map_err(|_| "Failed to lock scans state".to_string())?;
+                if let Some(scan) = scans.get_mut(scan_id) {
+                    scan.status = ScanLifecycle::Completed;
+                    scan.is_refreshing = true;
+                    scan.scanned_containers = snapshot.container_signatures.len();
+                    scan.total_containers = snapshot.container_signatures.len();
+                    scan.error = None;
+                    scan.cancelled = false;
+                    scan.assets = snapshot.assets;
+                    scan.asset_index = scan
+                        .assets
+                        .iter()
+                        .enumerate()
+                        .map(|(index, asset)| (asset.asset_id.clone(), index))
+                        .collect();
+                    scan.search_records = if snapshot.search_records.len() == scan.assets.len() {
+                        snapshot.search_records
+                    } else {
+                        scan.assets.iter().map(build_search_record).collect()
+                    };
+                    scan.tree_children = snapshot.tree_children;
+                    scan.container_assets = snapshot.container_assets;
+                    scan.container_signatures = snapshot.container_signatures;
+                    scan.id_aliases = HashMap::new();
+                    scan.cache_key = Some(cache_key.to_string());
+                }
+            }
+
+            let _ = app.emit(
+                "scan://completed",
+                ScanCompletedEvent {
+                    scan_id: scan_id.to_string(),
+                    lifecycle: ScanLifecycle::Completed,
+                    asset_count: cached_asset_count,
+                    error: None,
+                },
+            );
+
+            run_refresh_worker_inner(app, scan_id, req, cache_key)?;
+            return Ok(());
+        }
+    }
+
+    run_scan_worker(app.clone(), scan_id.to_string(), req.clone(), cache_key.to_string());
+    Ok(())
+}
+
 fn run_scan_worker(app: AppHandle, scan_id: String, req: StartScanRequest, cache_key: String) {
     let result = run_scan_worker_inner(&app, &scan_id, &req, &cache_key);
 
@@ -1678,7 +1698,7 @@ fn run_scan_worker_inner(
                         break;
                     }
                 };
-            match scan_container(container) {
+            match scan_container(container, &|| is_scan_cancelled(&app, &scan_id).unwrap_or(true)) {
                 Ok(candidates) => {
                     if sender
                         .send(ScanWorkerResult::Container {
@@ -1693,6 +1713,9 @@ fn run_scan_worker_inner(
                     }
                 }
                 Err(error) => {
+                    if is_scan_cancelled(&app, &scan_id).unwrap_or(true) {
+                        break;
+                    }
                     let _ = sender.send(ScanWorkerResult::Error(error));
                     break;
                 }
@@ -1805,20 +1828,6 @@ fn build_scan_indexes(
     }
 
     (asset_index, search_records, tree_children)
-}
-
-fn run_refresh_worker(app: AppHandle, scan_id: String, req: StartScanRequest, cache_key: String) {
-    let result = run_refresh_worker_inner(&app, &scan_id, &req, &cache_key);
-    if let Err(error) = result {
-        update_scan_error(&app, &scan_id, &error);
-        let _ = app.emit(
-            "scan://error",
-            serde_json::json!({
-                "scanId": scan_id,
-                "error": error,
-            }),
-        );
-    }
 }
 
 fn run_refresh_worker_inner(
@@ -1950,7 +1959,7 @@ fn run_refresh_worker_inner(
                 }
                 let container = &changed_containers[index];
                 let container_key = scan_container_key(container);
-                match scan_container(container) {
+                match scan_container(container, &|| is_scan_cancelled(&app, &scan_id).unwrap_or(true)) {
                     Ok(candidates) => {
                         if sender
                             .send(RefreshWorkerResult::Container {
@@ -1964,6 +1973,9 @@ fn run_refresh_worker_inner(
                         }
                     }
                     Err(error) => {
+                        if is_scan_cancelled(&app, &scan_id).unwrap_or(true) {
+                            break;
+                        }
                         let _ = sender.send(RefreshWorkerResult::Error(error));
                         break;
                     }
@@ -2373,16 +2385,22 @@ fn collect_scan_containers(
     Ok(containers)
 }
 
-fn scan_container(container: &ScanContainer) -> Result<Vec<AssetCandidate>, String> {
+fn scan_container(
+    container: &ScanContainer,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Vec<AssetCandidate>, String> {
     match container.container_type {
-        AssetContainerType::Directory => scan_directory_container(container),
-        AssetContainerType::Zip | AssetContainerType::Jar => scan_archive_container(container),
-        AssetContainerType::AssetIndex => scan_vanilla_asset_index_container(container),
+        AssetContainerType::Directory => scan_directory_container(container, should_cancel),
+        AssetContainerType::Zip | AssetContainerType::Jar => {
+            scan_archive_container(container, should_cancel)
+        }
+        AssetContainerType::AssetIndex => scan_vanilla_asset_index_container(container, should_cancel),
     }
 }
 
 fn scan_vanilla_asset_index_container(
     container: &ScanContainer,
+    should_cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<AssetCandidate>, String> {
     let content = fs::read_to_string(&container.container_path).map_err(|error| {
         format!(
@@ -2411,7 +2429,13 @@ fn scan_vanilla_asset_index_container(
     let objects_root = assets_root.join("objects");
 
     let mut assets = Vec::new();
+    let mut processed = 0usize;
     for (logical_path, object) in parsed.objects {
+        processed = processed.saturating_add(1);
+        if processed % SCAN_CANCEL_CHECK_INTERVAL == 0 && should_cancel() {
+            return Err("Scan cancelled".to_string());
+        }
+
         let Some((namespace, relative_asset_path)) = logical_path.split_once('/') else {
             continue;
         };
@@ -2458,14 +2482,23 @@ fn scan_vanilla_asset_index_container(
     Ok(assets)
 }
 
-fn scan_directory_container(container: &ScanContainer) -> Result<Vec<AssetCandidate>, String> {
+fn scan_directory_container(
+    container: &ScanContainer,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Vec<AssetCandidate>, String> {
     let mut assets = Vec::new();
+    let mut processed = 0usize;
 
     for entry in WalkDir::new(&container.container_path)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
     {
+        processed = processed.saturating_add(1);
+        if processed % SCAN_CANCEL_CHECK_INTERVAL == 0 && should_cancel() {
+            return Err("Scan cancelled".to_string());
+        }
+
         if !entry.file_type().is_file() {
             continue;
         }
@@ -2503,7 +2536,10 @@ fn scan_directory_container(container: &ScanContainer) -> Result<Vec<AssetCandid
     Ok(assets)
 }
 
-fn scan_archive_container(container: &ScanContainer) -> Result<Vec<AssetCandidate>, String> {
+fn scan_archive_container(
+    container: &ScanContainer,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<Vec<AssetCandidate>, String> {
     let file = fs::File::open(&container.container_path).map_err(|error| {
         format!(
             "Failed to open archive {}: {error}",
@@ -2521,6 +2557,10 @@ fn scan_archive_container(container: &ScanContainer) -> Result<Vec<AssetCandidat
     let mut assets = Vec::new();
 
     for index in 0..archive.len() {
+        if index % SCAN_CANCEL_CHECK_INTERVAL == 0 && should_cancel() {
+            return Err("Scan cancelled".to_string());
+        }
+
         let Ok(entry) = archive.by_index(index) else {
             continue;
         };
