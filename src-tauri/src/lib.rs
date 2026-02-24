@@ -31,8 +31,8 @@ const SCAN_CACHE_SCHEMA_VERSION: u32 = 2;
 const SCAN_CACHE_FILE_NAME: &str = "scan-cache-v2.json";
 const SCAN_CACHE_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 const SCAN_CACHE_MAX_ENTRIES: usize = 20;
-const MAX_SCAN_FINGERPRINT_WORKERS: usize = 12;
-const MAX_SCAN_WORKERS: usize = 8;
+const MAX_SCAN_FINGERPRINT_WORKERS: usize = 6;
+const MAX_SCAN_WORKERS: usize = 6;
 const MAX_EXPORT_WORKERS: usize = 16;
 
 #[derive(Default)]
@@ -3032,6 +3032,17 @@ fn is_export_cancelled(app: &AppHandle, operation_id: &str) -> bool {
 }
 
 fn emit_scan_progress(app: &AppHandle, event: ScanProgressEvent) {
+    let state = app.state::<AppState>();
+    if let Ok(mut scans) = state.scans.lock() {
+        if let Some(scan) = scans.get_mut(&event.scan_id) {
+            scan.scanned_containers = event.scanned_containers;
+            scan.total_containers = event.total_containers;
+            if matches!(scan.status, ScanLifecycle::Scanning) {
+                scan.error = None;
+            }
+        }
+    }
+
     let _ = app.emit("scan://progress", event);
 }
 
