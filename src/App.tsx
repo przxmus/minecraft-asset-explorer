@@ -54,6 +54,7 @@ const AUTO_SCAN_DEBOUNCE_MS = 260;
 const PROGRESS_STATUS_THROTTLE_MS = 250;
 const SCAN_STATUS_POLL_MS = 1000;
 const PREVIEW_TOP_GAP_PX = 14;
+const PREVIEW_CACHE_LIMIT = 24;
 const RELEASES_LATEST_API_URL =
   "https://api.github.com/repos/przxmus/minecraft-asset-explorer/releases/latest";
 const RELEASES_FALLBACK_URL = "https://github.com/przxmus/minecraft-asset-explorer/releases/latest";
@@ -578,6 +579,24 @@ function App() {
     [reconcileSelectionState, refreshVisibleTreeNodes],
   );
 
+  const waitForScanToStop = useCallback(async (targetScanId: string) => {
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      try {
+        const status = await invoke<ScanStatus>("get_scan_status", { scanId: targetScanId });
+        if (status.lifecycle !== "scanning" && !status.isRefreshing) {
+          return;
+        }
+      } catch {
+        return;
+      }
+
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, 80);
+      });
+    }
+  }, []);
+
   const startScan = useCallback(async (options?: { forceRescan?: boolean }) => {
     if (!prismRootCommitted || !selectedInstance) {
       return;
@@ -597,6 +616,8 @@ function App() {
       const previousScanId = activeScanIdRef.current;
       if (previousScanId) {
         await invoke("cancel_scan", { scanId: previousScanId }).catch(() => undefined);
+        setStatusLine("Stopping previous scan...");
+        await waitForScanToStop(previousScanId);
       }
 
       resetSearchState();
@@ -676,6 +697,7 @@ function App() {
     resetSearchState,
     selectedInstance,
     syncScanStatus,
+    waitForScanToStop,
   ]);
 
   const applySelection = useCallback(
@@ -1173,10 +1195,18 @@ function App() {
           assetId: activeAsset.assetId,
         });
 
-        setPreviewCache((current) => ({
-          ...current,
-          [activeAsset.assetId]: preview,
-        }));
+        setPreviewCache((current) => {
+          if (current[activeAsset.assetId]) {
+            return current;
+          }
+
+          const entries = Object.entries(current);
+          const keptEntries =
+            entries.length >= PREVIEW_CACHE_LIMIT
+              ? entries.slice(entries.length - (PREVIEW_CACHE_LIMIT - 1))
+              : entries;
+          return Object.fromEntries([...keptEntries, [activeAsset.assetId, preview]]);
+        });
       } catch (error) {
         setStatusLine(String(error));
       }
