@@ -24,7 +24,7 @@ Find, preview, and export Minecraft assets from your Prism Launcher instances in
 3. In `Prism Root`, set your Prism Launcher root directory.
 4. Pick an `Instance`.
 5. Keep the sources you want enabled (`Vanilla`, `Mods`, `Packs`).
-6. Wait for the scan to finish, then search, preview, and export assets.
+6. Wait for the first scan to finish, then search, preview, and export assets.
 
 ## How To Use
 
@@ -36,6 +36,8 @@ Find, preview, and export Minecraft assets from your Prism Launcher instances in
 
 The app starts scanning automatically once those are set.
 Scan progress is phase-aware (`estimating`, `scanning`) and starts immediately.
+After the first full scan, the same modpack config reopens instantly from cache on next app launch.
+Cache validation runs in the background (`refreshing`) and updates the index silently when files changed.
 
 ### 2) Find Assets Fast
 
@@ -57,6 +59,7 @@ Scan progress is phase-aware (`estimating`, `scanning`) and starts immediately.
 
 - `Copy`: puts selected files on your clipboard
 - `Save`: writes selected files into a folder you choose
+- `Rescan now`: forces a fresh scan for the current instance/config
 - Audio export format is controlled by the format dropdown (`Original` / `MP3` / `WAV`)
 - Large export operations show live progress and can be cancelled with `Cancel export`
 - Partial failures do not abort the whole export; you get a result panel with failed files
