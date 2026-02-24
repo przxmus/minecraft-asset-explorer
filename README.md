@@ -35,6 +35,7 @@ Find, preview, and export Minecraft assets from your Prism Launcher instances in
 - `Sources`: choose whether to include vanilla assets, mods, and/or resource packs
 
 The app starts scanning automatically once those are set.
+Scan progress is phase-aware (`estimating`, `fingerprinting`, `scanning`, `caching`) and starts immediately.
 
 ### 2) Find Assets Fast
 
@@ -57,6 +58,9 @@ The app starts scanning automatically once those are set.
 - `Copy`: puts selected files on your clipboard
 - `Save`: writes selected files into a folder you choose
 - Audio export format is controlled by the format dropdown (`Original` / `MP3` / `WAV`)
+- Large export operations show live progress and can be cancelled with `Cancel export`
+- Partial failures do not abort the whole export; you get a result panel with failed files
+- After `Save`, the destination folder is opened automatically
 
 ## Selection Shortcuts
 
