@@ -1284,7 +1284,7 @@ fn run_scan_worker_inner(
     }
 
     let workers = thread::available_parallelism()
-        .map(|value| value.get())
+        .map(|value| value.get().saturating_sub(2))
         .unwrap_or(1)
         .clamp(1, MAX_SCAN_WORKERS)
         .min(changed_containers.len());
@@ -1995,7 +1995,7 @@ fn resolve_scan_containers(
 
     let total = containers.len();
     let workers = thread::available_parallelism()
-        .map(|value| value.get())
+        .map(|value| value.get().saturating_sub(2))
         .unwrap_or(1)
         .clamp(1, MAX_SCAN_FINGERPRINT_WORKERS)
         .min(total);
