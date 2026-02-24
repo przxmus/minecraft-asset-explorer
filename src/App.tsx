@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type CSSProperties,
@@ -98,10 +98,33 @@ function scanPhaseLabel(phase: ScanPhase): string {
       return "Fingerprinting containers";
     case "scanning":
       return "Scanning assets";
-    case "caching":
-      return "Writing cache";
     default:
       return "Scanning";
+  }
+}
+
+async function openSavedDestination(destinationPath: string, savedFiles: string[]) {
+  try {
+    await openPath(destinationPath);
+    return;
+  } catch {
+    // fallback below
+  }
+
+  const firstSavedFile = savedFiles[0];
+  if (firstSavedFile) {
+    try {
+      await revealItemInDir(firstSavedFile);
+      return;
+    } catch {
+      // fallback below
+    }
+  }
+
+  try {
+    await openUrl(`file://${destinationPath}`);
+  } catch {
+    // no-op
   }
 }
 
@@ -154,7 +177,6 @@ function App() {
 
   const activeScanIdRef = useRef<string | null>(null);
   const activeExportOperationIdRef = useRef<string | null>(null);
-  const saveDestinationByOperationRef = useRef<Record<string, string>>({});
   const searchRequestSeqRef = useRef(0);
   const isSearchLoadingRef = useRef(false);
   const hasMoreSearchRef = useRef(false);
@@ -459,7 +481,6 @@ function App() {
 
       const operationId = crypto.randomUUID();
       activeExportOperationIdRef.current = operationId;
-      saveDestinationByOperationRef.current[operationId] = selectedPath;
       setExportSummary(null);
       setExportProgress({
         operationId,
@@ -488,12 +509,12 @@ function App() {
             response.cancelled ? " (cancelled)" : ""
           }.`,
         );
+        await openSavedDestination(selectedPath, response.savedFiles);
       } catch (error) {
         if (activeExportOperationIdRef.current === operationId) {
           activeExportOperationIdRef.current = null;
           setExportProgress(null);
         }
-        delete saveDestinationByOperationRef.current[operationId];
         setStatusLine(String(error));
       } finally {
         setIsSaving(false);
@@ -972,14 +993,6 @@ function App() {
               event.payload.cancelled ? " (cancelled)" : ""
             }.`,
           );
-
-          if (event.payload.kind === "save") {
-            const destination = saveDestinationByOperationRef.current[event.payload.operationId];
-            if (destination) {
-              delete saveDestinationByOperationRef.current[event.payload.operationId];
-              void openPath(destination).catch(() => undefined);
-            }
-          }
         },
       );
 

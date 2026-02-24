@@ -31,7 +31,7 @@ export type AssetRecord = {
 };
 
 export type ScanLifecycle = "scanning" | "completed" | "cancelled" | "error";
-export type ScanPhase = "estimating" | "fingerprinting" | "scanning" | "caching";
+export type ScanPhase = "estimating" | "fingerprinting" | "scanning";
 
 export type TreeNodeType = "folder" | "file";
 
