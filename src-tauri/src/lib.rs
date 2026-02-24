@@ -1853,8 +1853,7 @@ fn resolve_scan_containers(
     let workers = thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1)
-        .max(1)
-        .min(MAX_SCAN_FINGERPRINT_WORKERS)
+        .clamp(1, MAX_SCAN_FINGERPRINT_WORKERS)
         .min(total);
 
     let (sender, receiver) = mpsc::channel::<FingerprintWorkerResult>();
@@ -2481,7 +2480,7 @@ fn score_query(
     let required_matches = if token_count <= 2 {
         token_count
     } else {
-        ((token_count * 3) + 4) / 5
+        (token_count * 3).div_ceil(5)
     };
 
     if matched_tokens < required_matches {
@@ -3035,8 +3034,7 @@ fn run_export_operation(
     let workers = thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1)
-        .max(1)
-        .min(MAX_EXPORT_WORKERS)
+        .clamp(1, MAX_EXPORT_WORKERS)
         .min(requested_count);
 
     let (sender, receiver) = mpsc::channel::<ExportWorkerResult>();
@@ -3966,6 +3964,55 @@ mod tests {
         assert_eq!(next, "mod.sample.sample.sounds.block.grass.step.ogg.dup2");
     }
 
+    #[test]
+    fn resolve_operation_id_generates_uuid_when_missing() {
+        let generated = resolve_operation_id(None);
+        assert!(
+            Uuid::parse_str(&generated).is_ok(),
+            "generated operation id should be a UUID: {generated}"
+        );
+
+        let generated_from_empty = resolve_operation_id(Some("   ".to_string()));
+        assert!(
+            Uuid::parse_str(&generated_from_empty).is_ok(),
+            "generated operation id from empty input should be a UUID: {generated_from_empty}"
+        );
+    }
+
+    #[test]
+    fn plan_export_jobs_dedupes_filenames_and_applies_audio_extension() {
+        let temp_root = std::env::temp_dir().join(format!("mae-export-plan-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_root).expect("must create temp export directory");
+
+        let audio_one = sample_audio_asset(
+            "mod.audio.one.sounds.block.test.step.ogg",
+            "audio-one",
+            "sample",
+            "sounds/block/test/step.ogg",
+        );
+        let audio_two = sample_audio_asset(
+            "mod.audio.two.sounds.block.test.step.ogg",
+            "audio-two",
+            "sample",
+            "sounds/block/test/step.ogg",
+        );
+
+        let jobs = plan_export_jobs(vec![audio_one, audio_two], &temp_root, AudioFormat::Mp3);
+        let names = jobs
+            .iter()
+            .map(|job| {
+                job.output_path
+                    .file_name()
+                    .expect("output name must exist")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["step.mp3".to_string(), "step_1.mp3".to_string()]);
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
     fn sample_asset(
         key: &str,
         source_type: AssetSourceType,
@@ -3986,6 +4033,28 @@ mod tests {
                 .unwrap_or_default(),
             is_image: true,
             is_audio: false,
+            container_path: "/tmp/container".to_string(),
+            container_type: AssetContainerType::Jar,
+            entry_path: format!("assets/{namespace}/{relative_asset_path}"),
+        }
+    }
+
+    fn sample_audio_asset(
+        key: &str,
+        source_name: &str,
+        namespace: &str,
+        relative_asset_path: &str,
+    ) -> AssetRecord {
+        AssetRecord {
+            asset_id: key.to_string(),
+            key: key.to_string(),
+            source_type: AssetSourceType::Mod,
+            source_name: source_name.to_string(),
+            namespace: namespace.to_string(),
+            relative_asset_path: relative_asset_path.to_string(),
+            extension: "ogg".to_string(),
+            is_image: false,
+            is_audio: true,
             container_path: "/tmp/container".to_string(),
             container_type: AssetContainerType::Jar,
             entry_path: format!("assets/{namespace}/{relative_asset_path}"),
