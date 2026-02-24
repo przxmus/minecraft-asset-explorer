@@ -2,6 +2,7 @@ import type { ExportProgressEvent, ScanLifecycle, ScanProgressEvent } from "../t
 
 type StatusStripProps = {
   lifecycle: ScanLifecycle | "idle";
+  isRefreshing: boolean;
   lifecycleDotClass: string;
   progress: ScanProgressEvent | null;
   exportProgress: ExportProgressEvent | null;
@@ -11,6 +12,7 @@ type StatusStripProps = {
 
 export function StatusStrip({
   lifecycle,
+  isRefreshing,
   lifecycleDotClass,
   progress,
   exportProgress,
@@ -24,13 +26,13 @@ export function StatusStrip({
       : lifecycle === "scanning"
         ? "0% · 0/0 containers · 0 assets"
         : null;
-  const showProgress = lifecycle === "scanning" || progressLabel !== null;
+  const showProgress = lifecycle === "scanning" || isRefreshing || progressLabel !== null;
 
   return (
     <div className="status-strip">
       <span className="status-strip__lifecycle">
         <span className={`status-dot ${lifecycleDotClass}`} />
-        {lifecycle}
+        {isRefreshing ? `${lifecycle} (refreshing cache...)` : lifecycle}
       </span>
 
       {showProgress ? (

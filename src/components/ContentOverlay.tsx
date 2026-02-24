@@ -2,6 +2,7 @@ import type { InstanceInfo, ScanProgressEvent } from "../types/assets";
 
 type ContentOverlayProps = {
   needsInstanceSelection: boolean;
+  isRefreshing: boolean;
   instances: InstanceInfo[];
   progress: ScanProgressEvent | null;
   progressPercent: number;
@@ -11,6 +12,7 @@ type ContentOverlayProps = {
 
 export function ContentOverlay({
   needsInstanceSelection,
+  isRefreshing,
   instances,
   progress,
   progressPercent,
@@ -25,7 +27,11 @@ export function ContentOverlay({
     <div className="content-overlay">
       <div className="overlay-card">
         <div className="overlay-title">
-          {needsInstanceSelection ? "Choose an instance" : `Scanning assets... ${progressPercent}%`}
+          {needsInstanceSelection
+            ? "Choose an instance"
+            : isRefreshing
+              ? `Refreshing cache... ${progressPercent}%`
+              : `Scanning assets... ${progressPercent}%`}
         </div>
         <div className="overlay-subtitle">
           {needsInstanceSelection

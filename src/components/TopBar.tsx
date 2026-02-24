@@ -29,11 +29,13 @@ type TopBarProps = {
   isCopying: boolean;
   isSaving: boolean;
   isExportRunning: boolean;
+  isScanInProgress: boolean;
   onSelectAllVisible: () => void;
   onClearSelection: () => void;
   onCopySelection: () => void;
   onSaveSelection: () => void;
   onCancelExport: () => void;
+  onRescanNow: () => void;
 };
 
 export function TopBar({
@@ -64,11 +66,13 @@ export function TopBar({
   isCopying,
   isSaving,
   isExportRunning,
+  isScanInProgress,
   onSelectAllVisible,
   onClearSelection,
   onCopySelection,
   onSaveSelection,
   onCancelExport,
+  onRescanNow,
 }: TopBarProps) {
   function handleRootInputKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     if (event.key === "Enter") {
@@ -229,6 +233,14 @@ export function TopBar({
             onClick={onSaveSelection}
           >
             {isSaving ? "Saving..." : `Save (${selectedAssetCount})`}
+          </button>
+          <button
+            type="button"
+            className="mae-button"
+            disabled={!selectedInstance || isScanInProgress}
+            onClick={onRescanNow}
+          >
+            {isScanInProgress ? "Scanning..." : "Rescan now"}
           </button>
           {isExportRunning ? (
             <button type="button" className="mae-button" onClick={onCancelExport}>

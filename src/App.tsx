@@ -32,7 +32,9 @@ import type {
   ExportFailure,
   InstanceInfo,
   PrismRootCandidate,
+  ReconcileAssetIdsResponse,
   SaveAssetsResult,
+  StartScanResponse,
   ScanCompletedEvent,
   ScanLifecycle,
   ScanPhase,
@@ -55,6 +57,7 @@ const PREVIEW_TOP_GAP_PX = 14;
 const RELEASES_LATEST_API_URL =
   "https://api.github.com/repos/przxmus/minecraft-asset-explorer/releases/latest";
 const RELEASES_FALLBACK_URL = "https://github.com/przxmus/minecraft-asset-explorer/releases/latest";
+const LAST_SCAN_CONFIG_STORAGE_KEY = "mae:last-scan-config";
 
 type LatestReleaseResponse = {
   tag_name?: string;
@@ -78,6 +81,14 @@ type ExportSummary = {
   failures: ExportFailure[];
 };
 
+type PersistedScanConfig = {
+  prismRootCommitted: string;
+  selectedInstance: string;
+  includeVanilla: boolean;
+  includeMods: boolean;
+  includeResourcepacks: boolean;
+};
+
 function parentFolderNodeId(nodeId: string): string {
   const marker = "/file:";
   const markerIndex = nodeId.lastIndexOf(marker);
@@ -98,8 +109,39 @@ function scanPhaseLabel(phase: ScanPhase): string {
       return "Estimating containers";
     case "scanning":
       return "Scanning assets";
+    case "refreshing":
+      return "Refreshing cache";
     default:
       return "Scanning";
+  }
+}
+
+function readPersistedScanConfig(): PersistedScanConfig | null {
+  try {
+    const raw = window.localStorage.getItem(LAST_SCAN_CONFIG_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as Partial<PersistedScanConfig>;
+    if (
+      typeof parsed.prismRootCommitted !== "string" ||
+      typeof parsed.selectedInstance !== "string" ||
+      typeof parsed.includeVanilla !== "boolean" ||
+      typeof parsed.includeMods !== "boolean" ||
+      typeof parsed.includeResourcepacks !== "boolean"
+    ) {
+      return null;
+    }
+
+    return {
+      prismRootCommitted: parsed.prismRootCommitted,
+      selectedInstance: parsed.selectedInstance,
+      includeVanilla: parsed.includeVanilla,
+      includeMods: parsed.includeMods,
+      includeResourcepacks: parsed.includeResourcepacks,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -144,6 +186,7 @@ function App() {
 
   const [scanId, setScanId] = useState<string | null>(null);
   const [lifecycle, setLifecycle] = useState<ScanLifecycle | "idle">("idle");
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [progress, setProgress] = useState<ScanProgressEvent | null>(null);
 
   const [query, setQuery] = useState("");
@@ -194,6 +237,7 @@ function App() {
   const autoScanTimeoutRef = useRef<number | null>(null);
   const lastScanConfigKeyRef = useRef<string | null>(null);
   const progressRef = useRef<ScanProgressEvent | null>(null);
+  const isRefreshingRef = useRef(false);
   const listParentRef = useRef<HTMLDivElement | null>(null);
   const previewContentRef = useRef<HTMLDivElement | null>(null);
   const previewPanelRef = useRef<HTMLElement | null>(null);
@@ -352,9 +396,84 @@ function App() {
     ],
   );
 
+  const reconcileSelectionState = useCallback(
+    async (resolvedScanId: string) => {
+      const requestedIds = new Set<string>();
+      selectedAssets.forEach((assetId) => requestedIds.add(assetId));
+      if (selectionAnchorId) {
+        requestedIds.add(selectionAnchorId);
+      }
+      if (activeAsset) {
+        requestedIds.add(activeAsset.assetId);
+      }
+      if (requestedIds.size === 0) {
+        return;
+      }
+
+      try {
+        const response = await invoke<ReconcileAssetIdsResponse>("reconcile_asset_ids", {
+          req: {
+            scanId: resolvedScanId,
+            assetIds: Array.from(requestedIds),
+          },
+        });
+
+        setSelectedAssets((current) => {
+          const next = new Set<string>();
+          current.forEach((assetId) => {
+            const mapped = response.idMap[assetId];
+            if (mapped) {
+              next.add(mapped);
+            }
+          });
+          return next;
+        });
+
+        setSelectionAnchorId((current) => {
+          if (!current) {
+            return null;
+          }
+          return response.idMap[current] ?? null;
+        });
+
+        setPreviewCache((current) => {
+          const next: Record<string, AssetPreviewResponse> = {};
+          for (const [assetId, preview] of Object.entries(current)) {
+            const mapped = response.idMap[assetId];
+            if (mapped) {
+              next[mapped] = preview;
+            }
+          }
+          return next;
+        });
+
+        if (activeAsset) {
+          const mappedActiveId = response.idMap[activeAsset.assetId];
+          if (!mappedActiveId) {
+            setActiveAsset(null);
+            return;
+          }
+
+          const refreshed = await invoke<AssetRecord>("get_asset_record", {
+            scanId: resolvedScanId,
+            assetId: mappedActiveId,
+          });
+          setActiveAsset(refreshed);
+        }
+      } catch {
+        // keep previous selection if reconciliation fails
+      }
+    },
+    [activeAsset, selectedAssets, selectionAnchorId],
+  );
+
   useEffect(() => {
     progressRef.current = progress;
   }, [progress]);
+
+  useEffect(() => {
+    isRefreshingRef.current = isRefreshing;
+  }, [isRefreshing]);
 
   const syncScanStatus = useCallback(
     async (targetScanId: string) => {
@@ -383,11 +502,17 @@ function App() {
             : Math.max(status.scannedContainers, totalContainers);
         const assetCount = Math.max(status.assetCount, currentProgress?.assetCount ?? 0);
         const inferredPhase: ScanPhase =
-          currentProgress
-            ? currentProgress.phase
-            : totalContainers === 0
+          status.lifecycle === "scanning"
+            ? totalContainers === 0
               ? "estimating"
-              : "scanning";
+              : "scanning"
+            : status.isRefreshing
+              ? "refreshing"
+              : currentProgress
+                ? currentProgress.phase
+                : totalContainers === 0
+                  ? "estimating"
+                  : "scanning";
         const nextProgress: ScanProgressEvent = {
           scanId: status.scanId,
           scannedContainers,
@@ -397,6 +522,7 @@ function App() {
           currentSource: currentProgress?.currentSource,
         };
         setProgress(nextProgress);
+        setIsRefreshing(status.isRefreshing);
 
         if (status.lifecycle === "scanning") {
           setLifecycle("scanning");
@@ -409,11 +535,22 @@ function App() {
         }
 
         setLifecycle(status.lifecycle);
+        if (status.isRefreshing) {
+          if (terminalScanSyncRef.current !== status.scanId) {
+            terminalScanSyncRef.current = status.scanId;
+            void refreshVisibleTreeNodes(status.scanId);
+            setScanRefreshToken((value) => value + 1);
+          }
+          setStatusLine(`${scanPhaseLabel(nextProgress.phase)} · ${formatScanProgressLine(nextProgress)}`);
+          return;
+        }
+
         if (status.lifecycle === "completed") {
           setStatusLine(`Scan completed: ${nextProgress.assetCount} assets indexed.`);
           if (terminalScanSyncRef.current !== status.scanId) {
             terminalScanSyncRef.current = status.scanId;
             void refreshVisibleTreeNodes(status.scanId);
+            void reconcileSelectionState(status.scanId);
             setScanRefreshToken((value) => value + 1);
           }
         } else if (status.lifecycle === "cancelled") {
@@ -429,10 +566,10 @@ function App() {
         isSyncingScanStatusRef.current = false;
       }
     },
-    [refreshVisibleTreeNodes],
+    [reconcileSelectionState, refreshVisibleTreeNodes],
   );
 
-  const startScan = useCallback(async () => {
+  const startScan = useCallback(async (options?: { forceRescan?: boolean }) => {
     if (!prismRootCommitted || !selectedInstance) {
       return;
     }
@@ -463,6 +600,7 @@ function App() {
       setActiveAsset(null);
       setPreviewCache({});
       setProgress(null);
+      setIsRefreshing(false);
       setScanId(null);
       activeScanIdRef.current = null;
       setExportProgress(null);
@@ -473,26 +611,46 @@ function App() {
       isSyncingScanStatusRef.current = false;
       setStatusLine("Estimating containers · 0/0 containers · 0 assets");
 
-      const response = await invoke<{ scanId: string }>("start_scan", {
+      const response = await invoke<StartScanResponse>("start_scan", {
         req: {
           prismRoot: prismRootCommitted,
           instanceFolder: selectedInstance,
           includeVanilla,
           includeMods,
           includeResourcepacks,
+          forceRescan: options?.forceRescan ?? false,
         },
       });
 
       activeScanIdRef.current = response.scanId;
       setScanId(response.scanId);
-      setProgress({
-        scanId: response.scanId,
-        scannedContainers: 0,
-        totalContainers: 0,
-        assetCount: 0,
-        phase: "estimating",
-      });
-      setStatusLine("Estimating containers · 0/0 containers · 0 assets");
+      if (response.cacheHit) {
+        setLifecycle("completed");
+        setIsRefreshing(response.refreshStarted);
+        setProgress((current) =>
+          current ?? {
+            scanId: response.scanId,
+            scannedContainers: 0,
+            totalContainers: 0,
+            assetCount: 0,
+            phase: response.refreshStarted ? "refreshing" : "estimating",
+          },
+        );
+        setStatusLine(
+          response.refreshStarted
+            ? "Loaded cached index instantly. Refreshing cache in background..."
+            : "Loaded cached index instantly.",
+        );
+      } else {
+        setProgress({
+          scanId: response.scanId,
+          scannedContainers: 0,
+          totalContainers: 0,
+          assetCount: 0,
+          phase: "estimating",
+        });
+        setStatusLine("Estimating containers · 0/0 containers · 0 assets");
+      }
       void syncScanStatus(response.scanId);
     } catch (error) {
       setStatusLine(String(error));
@@ -817,6 +975,17 @@ function App() {
 
   useEffect(() => {
     const boot = async () => {
+      const restored = readPersistedScanConfig();
+      if (restored) {
+        setPrismRootInput(restored.prismRootCommitted);
+        setPrismRootCommitted(restored.prismRootCommitted);
+        setSelectedInstance(restored.selectedInstance);
+        setIncludeVanilla(restored.includeVanilla);
+        setIncludeMods(restored.includeMods);
+        setIncludeResourcepacks(restored.includeResourcepacks);
+        return;
+      }
+
       try {
         const roots = await invoke<PrismRootCandidate[]>("detect_prism_roots");
         const preferred = roots.find((root) => root.valid) ?? roots[0];
@@ -892,6 +1061,25 @@ function App() {
 
     void refreshInstances(prismRootCommitted);
   }, [prismRootCommitted, refreshInstances]);
+
+  useEffect(() => {
+    if (!prismRootCommitted) {
+      return;
+    }
+
+    const payload: PersistedScanConfig = {
+      prismRootCommitted,
+      selectedInstance,
+      includeVanilla,
+      includeMods,
+      includeResourcepacks,
+    };
+    try {
+      window.localStorage.setItem(LAST_SCAN_CONFIG_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // ignore persistence failures
+    }
+  }, [includeMods, includeResourcepacks, includeVanilla, prismRootCommitted, selectedInstance]);
 
   useEffect(() => {
     if (autoScanTimeoutRef.current) {
@@ -1021,7 +1209,12 @@ function App() {
         }
 
         lastScanProgressAtRef.current = Date.now();
-        setLifecycle("scanning");
+        if (event.payload.phase === "refreshing") {
+          setIsRefreshing(true);
+        } else {
+          setLifecycle("scanning");
+          setIsRefreshing(false);
+        }
         setProgress(event.payload);
         const now = Date.now();
         if (now - lastStatusAtRef.current >= PROGRESS_STATUS_THROTTLE_MS) {
@@ -1035,16 +1228,23 @@ function App() {
           return;
         }
 
+        const wasRefreshing = isRefreshingRef.current;
         terminalScanSyncRef.current = event.payload.scanId;
         setLifecycle(event.payload.lifecycle);
+        setIsRefreshing(false);
         lastScanProgressAtRef.current = Date.now();
         setStatusLine(
           event.payload.lifecycle === "completed"
-            ? `Scan completed: ${event.payload.assetCount} assets indexed.`
+            ? wasRefreshing
+              ? `Refresh completed: ${event.payload.assetCount} assets indexed.`
+              : `Scan completed: ${event.payload.assetCount} assets indexed.`
             : `Scan finished with status: ${event.payload.lifecycle}`,
         );
 
         void refreshVisibleTreeNodes();
+        if (wasRefreshing && event.payload.lifecycle === "completed") {
+          void reconcileSelectionState(event.payload.scanId);
+        }
         setScanRefreshToken((value) => value + 1);
       });
 
@@ -1056,6 +1256,7 @@ function App() {
           }
 
           setLifecycle("error");
+          setIsRefreshing(false);
           lastScanProgressAtRef.current = Date.now();
           setStatusLine(event.payload.error);
         },
@@ -1133,10 +1334,10 @@ function App() {
     return () => {
       teardown?.();
     };
-  }, [refreshVisibleTreeNodes]);
+  }, [reconcileSelectionState, refreshVisibleTreeNodes]);
 
   useEffect(() => {
-    if (lifecycle !== "scanning" || !scanId) {
+    if ((!isRefreshing && lifecycle !== "scanning") || !scanId) {
       return;
     }
 
@@ -1152,7 +1353,7 @@ function App() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [lifecycle, scanId, syncScanStatus]);
+  }, [isRefreshing, lifecycle, scanId, syncScanStatus]);
 
   const currentPreview = activeAsset ? previewCache[activeAsset.assetId] : undefined;
   const needsInstanceSelection = !selectedInstance;
@@ -1272,6 +1473,7 @@ function App() {
           isCopying={isCopying}
           isSaving={isSaving}
           isExportRunning={isExportRunning}
+          isScanInProgress={isScanInProgress}
           onSelectAllVisible={selectAllVisible}
           onClearSelection={clearSelection}
           onCopySelection={() => {
@@ -1283,9 +1485,13 @@ function App() {
           onCancelExport={() => {
             void cancelExport();
           }}
+          onRescanNow={() => {
+            void startScan({ forceRescan: true });
+          }}
         />
         <StatusStrip
           lifecycle={lifecycle}
+          isRefreshing={isRefreshing}
           lifecycleDotClass={lifecycleDotClass}
           progress={effectiveScanProgress}
           exportProgress={exportProgress}
@@ -1375,6 +1581,7 @@ function App() {
         {isExplorerLocked ? (
           <ContentOverlay
             needsInstanceSelection={needsInstanceSelection}
+            isRefreshing={isRefreshing}
             instances={instances}
             progress={effectiveScanProgress}
             progressPercent={progressPercent}

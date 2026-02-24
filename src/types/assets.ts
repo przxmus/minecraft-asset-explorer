@@ -13,7 +13,7 @@ export type InstanceInfo = {
 };
 
 export type AssetSourceType = "vanilla" | "mod" | "resourcePack";
-export type AssetContainerType = "directory" | "zip" | "jar";
+export type AssetContainerType = "directory" | "zip" | "jar" | "assetIndex";
 
 export type AssetRecord = {
   assetId: string;
@@ -31,7 +31,14 @@ export type AssetRecord = {
 };
 
 export type ScanLifecycle = "scanning" | "completed" | "cancelled" | "error";
-export type ScanPhase = "estimating" | "scanning";
+export type ScanPhase = "estimating" | "scanning" | "refreshing";
+
+export type StartScanResponse = {
+  scanId: string;
+  cacheHit: boolean;
+  refreshStarted: boolean;
+  refreshMode?: "incremental" | "full";
+};
 
 export type TreeNodeType = "folder" | "file";
 
@@ -55,6 +62,7 @@ export type ScanProgressEvent = {
 export type ScanStatus = {
   scanId: string;
   lifecycle: ScanLifecycle;
+  isRefreshing: boolean;
   scannedContainers: number;
   totalContainers: number;
   assetCount: number;
@@ -129,6 +137,11 @@ export type CopyResult = {
 export type SearchResponse = {
   total: number;
   assets: AssetRecord[];
+};
+
+export type ReconcileAssetIdsResponse = {
+  idMap: Record<string, string>;
+  assetIds: string[];
 };
 
 export type SelectionModifiers = {
