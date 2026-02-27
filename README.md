@@ -2,6 +2,8 @@
 
 Find, preview, and export Minecraft assets from your Prism Launcher instances in one place.
 
+![Minecraft Asset Explorer app screenshot](./docs/screenshots/app-main-window.png)
+
 ![Minecraft Asset Explorer icon](./icon.png)
 
 ## What You Can Do
