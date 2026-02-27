@@ -2,7 +2,7 @@
 
 Find, preview, and export Minecraft assets from your Prism Launcher instances in one place.
 
-![Minecraft Asset Explorer app screenshot](./docs/screenshots/app-main-window.png)
+![Minecraft Asset Explorer app screenshot](./docs/screenshots/app-main-window-c.png)
 
 ## What You Can Do
 
@@ -115,7 +115,7 @@ Cross-target notes:
   - `TAURI_TARGET_MACOS`
   - `TAURI_TARGET_LINUX`
   - `TAURI_TARGET_WINDOWS`
-  (comma-separated for multiple triples)
+    (comma-separated for multiple triples)
 - On macOS/Linux hosts, Windows builds prefer `x86_64-pc-windows-gnu` by default to avoid MSVC SDK requirements.
 - Windows GNU cross-builds on macOS/Linux also require MinGW tools (`dlltool`, `windres`), typically via `brew install mingw-w64`.
 - Windows installer bundling also requires NSIS (`makensis`), typically via `brew install nsis`.
